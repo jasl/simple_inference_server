@@ -1,0 +1,78 @@
+version: "3.9"
+
+networks:
+  inference:
+    driver: bridge
+
+services:
+  chat:
+    build:
+      context: .
+      dockerfile: Dockerfile.cuda
+    container_name: inference-chat
+    environment:
+      # Chat-only replica on GPU0
+      - MODELS=llama-3.2-3b-instruct
+      - MODEL_DEVICE=cuda
+      - MAX_CONCURRENT=1           # keep decode contention low
+      - ENABLE_BATCHING=0          # chat path runs per-request
+      - HF_HOME=/app/models
+      - ENABLE_WARMUP=1
+    volumes:
+      - ./models:/app/models:ro
+    expose:
+      - "8000"
+    gpus:
+      - "device=0"                # requires Docker + nvidia-container-toolkit
+    healthcheck:
+      test: ["CMD-SHELL", "curl -sf http://localhost:8000/health || exit 1"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+    restart: unless-stopped
+    networks:
+      - inference
+
+  embed:
+    build:
+      context: .
+      dockerfile: Dockerfile.cuda
+    container_name: inference-embed
+    environment:
+      # Embedding replica on GPU1
+      - MODELS=bge-m3
+      - MODEL_DEVICE=cuda
+      - ENABLE_BATCHING=1
+      - BATCH_WINDOW_MS=6
+      - BATCH_WINDOW_MAX_SIZE=16
+      - MAX_CONCURRENT=6
+      - HF_HOME=/app/models
+      - ENABLE_WARMUP=1
+    volumes:
+      - ./models:/app/models:ro
+    expose:
+      - "8000"
+    gpus:
+      - "device=1"
+    healthcheck:
+      test: ["CMD-SHELL", "curl -sf http://localhost:8000/health || exit 1"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+    restart: unless-stopped
+    networks:
+      - inference
+
+  lb:
+    image: nginx:1.27-alpine
+    container_name: inference-lb
+    depends_on:
+      - chat
+      - embed
+    ports:
+      - "8080:8080"   # external entrypoint
+    volumes:
+      - ./lb/nginx.conf:/etc/nginx/nginx.conf:ro
+    restart: unless-stopped
+    networks:
+      - inference
