@@ -25,10 +25,12 @@ QUEUE_TIMEOUT_SEC = float(os.getenv("QUEUE_TIMEOUT_SEC", "2.0"))
 _semaphore: asyncio.Semaphore = asyncio.Semaphore(MAX_CONCURRENT)
 _queue: asyncio.Queue[int] = asyncio.Queue(MAX_QUEUE_SIZE)
 _state = {"accepting": True}
+_in_flight_count = 0
 
 
 @asynccontextmanager
 async def limiter() -> AsyncIterator[None]:
+    global _in_flight_count
     if not _state["accepting"]:
         raise ShuttingDownError("Service is shutting down")
     try:
@@ -45,8 +47,10 @@ async def limiter() -> AsyncIterator[None]:
             raise QueueTimeoutError("Timed out waiting for worker") from exc
 
         try:
+            _in_flight_count += 1
             yield
         finally:
+            _in_flight_count -= 1
             _semaphore.release()
     finally:
         _queue.get_nowait()
@@ -62,8 +66,7 @@ async def wait_for_drain(timeout: float = 5.0) -> None:
     """Wait for in-flight work to finish, with a timeout."""
     deadline = asyncio.get_event_loop().time() + timeout
     while True:
-        in_flight = _queue.qsize() > 0 or _semaphore._value < MAX_CONCURRENT
-        if not in_flight:
+        if _queue.qsize() == 0 and _in_flight_count == 0:
             break
         if asyncio.get_event_loop().time() >= deadline:
             break
