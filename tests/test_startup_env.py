@@ -39,7 +39,7 @@ models:
     monkeypatch.setenv("MODEL_CONFIG", str(cfg))
     monkeypatch.setenv("MODELS", "repo/a")
     monkeypatch.setenv("HF_HOME", str(tmp_path / "models"))
-    monkeypatch.setattr("huggingface_hub.snapshot_download", DummyHub.snapshot_download)
+    monkeypatch.setattr(main, "snapshot_download", DummyHub.snapshot_download)
 
     # Use private helper directly to avoid full startup side effects.
     main._download_models_if_enabled(str(cfg), ["repo/a"], cache_dir=os.environ["HF_HOME"])
@@ -86,7 +86,7 @@ models:
     def fake_snapshot_download(**kwargs: object) -> None:
         called.append("called")
 
-    monkeypatch.setattr("huggingface_hub.snapshot_download", fake_snapshot_download)
+    monkeypatch.setattr(main, "snapshot_download", fake_snapshot_download)
 
     with pytest.raises(SystemExit):
         main._download_models_if_enabled(str(cfg), ["repo/missing"], cache_dir=os.environ["HF_HOME"])
