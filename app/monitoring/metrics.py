@@ -22,6 +22,18 @@ QUEUE_REJECTIONS = Counter(
     "Requests rejected due to queue limits",
 )
 
+CACHE_HITS = Counter(
+    "embedding_cache_hits_total",
+    "Cache hits when serving embeddings",
+    labelnames=("model",),
+)
+
+CACHE_MISSES = Counter(
+    "embedding_cache_misses_total",
+    "Cache misses when serving embeddings",
+    labelnames=("model",),
+)
+
 
 def setup_metrics(app: Starlette) -> None:
     if os.getenv("ENABLE_METRICS", "1") == "0":
@@ -43,3 +55,13 @@ def observe_latency(model: str, seconds: float) -> None:
 def record_queue_rejection() -> None:
     with suppress(Exception):
         QUEUE_REJECTIONS.inc()
+
+
+def record_cache_usage(model: str, hits: int, misses: int) -> None:
+    """Record cache hits/misses for observability."""
+
+    with suppress(Exception):
+        if hits:
+            CACHE_HITS.labels(model=model).inc(hits)
+        if misses:
+            CACHE_MISSES.labels(model=model).inc(misses)

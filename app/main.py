@@ -1,8 +1,8 @@
 import logging
 import os
+from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from pathlib import Path
-from collections.abc import AsyncIterator
 
 from dotenv import load_dotenv
 from fastapi import FastAPI

@@ -9,6 +9,7 @@ Built with FastAPI, PyTorch, and Hugging Face Transformers.
 - Health check `GET /health`
 - Optional Prometheus metrics at `/metrics`
 - Preloaded, offline models (no runtime downloads)
+- In-memory LRU cache for recent embeddings (configurable)
 - Bounded concurrency with 429 backpressure
 - Model list `GET /v1/models` (OpenAI-compatible)
 - Batch and input guards: `MAX_BATCH_SIZE` (default 32), `MAX_TEXT_CHARS` (default 20000)
@@ -50,6 +51,8 @@ Default model cache is locked to the repo-local `models/` directory. Pre-downloa
 Environment variables can be kept in a `.env` file (see `.env.example`) and are loaded on startup without overriding existing variables. Startup performs an optional warmup for each model (toggle via `ENABLE_WARMUP`, default on): it runs a batch through every executor worker to initialize per-thread tokenizers and compile kernels. Control batch and repetitions with `WARMUP_BATCH_SIZE` and `WARMUP_STEPS`.
 
 Request batching: by default the server can micro-batch concurrent embedding requests. Configure via `ENABLE_BATCHING` (default on), `BATCH_WINDOW_MS` (collection window), and `BATCH_WINDOW_MAX_SIZE` (max combined batch). Set `BATCH_WINDOW_MS=0` to effectively disable coalescing.
+
+Embedding cache: repeated inputs are served from an in-memory LRU keyed by the full text. Control size with `EMBEDDING_CACHE_SIZE` (default `256` entries per model instance); set to `0` to disable. Prometheus counters `embedding_cache_hits_total` / `embedding_cache_misses_total` expose effectiveness per model.
 
 ## Performance tuning (quick checklist)
 

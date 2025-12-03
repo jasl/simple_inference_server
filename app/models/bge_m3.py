@@ -1,12 +1,13 @@
 import os
 import threading
 from pathlib import Path
+from typing import Any
 
 import numpy as np
 import torch
 from transformers import AutoModel, AutoTokenizer
-from typing import Any
 
+from app.embedding_cache import EmbeddingCache, embed_with_cache
 from app.models.base import EmbeddingModel
 
 
@@ -19,6 +20,8 @@ class BgeM3Embedding(EmbeddingModel):
         self._tokenizer_local = threading.local()
         models_dir = Path(__file__).resolve().parent.parent.parent / "models"
         self.cache_dir = str(models_dir) if models_dir.exists() else os.environ.get("HF_HOME")
+        cache_size = int(os.getenv("EMBEDDING_CACHE_SIZE", "256"))
+        self._cache = EmbeddingCache(max_size=max(cache_size, 0))
         # Warm a tokenizer for the creating thread; other threads lazily init their own.
         self._tokenizer_local.tokenizer = AutoTokenizer.from_pretrained(
             hf_repo_id, local_files_only=True, cache_dir=self.cache_dir
@@ -30,7 +33,7 @@ class BgeM3Embedding(EmbeddingModel):
         self.dim = self.model.config.hidden_size
 
     @torch.no_grad()
-    def embed(self, texts: list[str]) -> np.ndarray:
+    def _encode(self, texts: list[str]) -> np.ndarray:
         tokenizer = self._get_tokenizer()
         batch = tokenizer(texts, padding=True, truncation=True, return_tensors="pt").to(
             self.device
@@ -44,6 +47,9 @@ class BgeM3Embedding(EmbeddingModel):
         embeddings = sum_hidden / lengths
         embeddings = torch.nn.functional.normalize(embeddings, p=2, dim=1)
         return embeddings.cpu().numpy()
+
+    def embed(self, texts: list[str]) -> np.ndarray:
+        return embed_with_cache(texts, self._encode, self._cache, self.name)
 
     def count_tokens(self, texts: list[str]) -> int:
         # token counting uses tokenizer on CPU; no gradient required
