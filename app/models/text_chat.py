@@ -53,6 +53,11 @@ class TextChatModel(ChatModel):
             local_files_only=True,
             cache_dir=os.environ.get("HF_HOME"),
         )
+        # Ensure padding is defined for batched generation; fall back to EOS when absent.
+        if self.tokenizer.pad_token_id is None:
+            self.tokenizer.pad_token = self.tokenizer.eos_token
+        # Left padding keeps the latest tokens aligned across a batch.
+        self.tokenizer.padding_side = "left"
 
         device_map = self._resolve_device_map(device)
         self.model = AutoModelForCausalLM.from_pretrained(
@@ -84,15 +89,16 @@ class TextChatModel(ChatModel):
             return_tensors="pt",
             return_dict=True,
         )
-        if not isinstance(raw_inputs, dict):
-            raise ValueError("Tokenizer returned unexpected format for chat template")
-        inputs = {k: v.to(self.model.device) for k, v in raw_inputs.items()}
+        inputs = self._move_to_device(self._normalize_chat_template_output(raw_inputs))
 
         gen_kwargs: dict[str, Any] = {
             "max_new_tokens": max_new_tokens,
             "do_sample": temperature > 0,
             "temperature": temperature,
             "top_p": top_p,
+            "use_cache": True,  # keep KV cache enabled for speed
+            "pad_token_id": self.tokenizer.pad_token_id,
+            "eos_token_id": self.tokenizer.eos_token_id,
         }
         if stop_criteria is not None:
             gen_kwargs["stopping_criteria"] = stop_criteria
@@ -117,6 +123,104 @@ class TextChatModel(ChatModel):
             completion_tokens=completion_tokens,
             finish_reason="stop" if stop_hit else finish_reason,
         )
+
+    def batched_generate(
+        self,
+        batch_messages: list[Sequence[dict[str, Any]]],
+        *,
+        max_new_tokens: int,
+        temperature: float,
+        top_p: float,
+        stop: list[str] | None = None,
+    ) -> list[ChatGeneration]:
+        """Batched generation for compatible requests (shared decoding params)."""
+
+        stop = stop or []
+        encodings = []
+        prompt_lengths: list[int] = []
+        for msgs in batch_messages:
+            raw_inputs = self.tokenizer.apply_chat_template(
+                msgs,
+                tokenize=True,
+                add_generation_prompt=True,
+                return_tensors="pt",
+                return_dict=True,
+            )
+            normalized = self._normalize_chat_template_output(raw_inputs)
+            encodings.append(normalized)
+            prompt_lengths.append(int(normalized["input_ids"].shape[1]))
+
+        padded = self.tokenizer.pad(encodings, padding=True, return_tensors="pt")
+        inputs = self._move_to_device(self._normalize_chat_template_output(padded))
+
+        gen_kwargs: dict[str, Any] = {
+            "max_new_tokens": max_new_tokens,
+            "do_sample": temperature > 0,
+            "temperature": temperature,
+            "top_p": top_p,
+            "pad_token_id": self.tokenizer.pad_token_id,
+            "eos_token_id": self.tokenizer.eos_token_id,
+            "use_cache": True,
+        }
+
+        with torch.no_grad():
+            output_ids = self.model.generate(**inputs, **gen_kwargs)
+
+        generations: list[ChatGeneration] = []
+        for idx, prompt_len in enumerate(prompt_lengths):
+            generated_ids = output_ids[idx, prompt_len:]
+            completion_tokens = int(generated_ids.shape[0])
+            finish_reason = "length" if completion_tokens >= max_new_tokens else "stop"
+
+            text = self.tokenizer.decode(generated_ids, skip_special_tokens=True)
+            text, trimmed = self._trim_with_stop(text, stop)
+            stop_hit = trimmed
+
+            generations.append(
+                ChatGeneration(
+                    text=text.strip(),
+                    prompt_tokens=prompt_len,
+                    completion_tokens=completion_tokens,
+                    finish_reason="stop" if stop_hit else finish_reason,
+                )
+            )
+        return generations
+
+    def _normalize_chat_template_output(self, raw_inputs: Any) -> dict[str, torch.Tensor]:
+        """Handle tokenizer outputs that may be dict, BatchEncoding, or tuple/list."""
+
+        if isinstance(raw_inputs, dict):
+            return raw_inputs
+        # BatchEncoding behaves like dict for .items()
+        if hasattr(raw_inputs, "data") and isinstance(getattr(raw_inputs, "data"), dict):
+            return cast(dict[str, torch.Tensor], raw_inputs.data)
+        if hasattr(raw_inputs, "input_ids"):
+            # Some tokenizers may return namespace-like objects
+            return {"input_ids": raw_inputs.input_ids, "attention_mask": getattr(raw_inputs, "attention_mask", None)}
+        raise ValueError("Tokenizer returned unexpected format for chat template")
+
+    def _move_to_device(self, inputs: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
+        """Move tensors to the model device, using pinned memory + non_blocking when on CUDA."""
+
+        use_pinned = self._can_pin_memory()
+        device = self.model.device
+
+        moved: dict[str, torch.Tensor] = {}
+        for key, tensor in inputs.items():
+            if tensor is None:
+                continue
+            pinned = tensor
+            if use_pinned and tensor.device.type == "cpu" and hasattr(tensor, "pin_memory"):
+                try:
+                    pinned = tensor.pin_memory()
+                except RuntimeError:
+                    pinned = tensor  # pinning not supported (e.g., no CUDA build)
+            moved[key] = pinned.to(device, non_blocking=use_pinned)
+        return moved
+
+    def _can_pin_memory(self) -> bool:
+        device = getattr(self.model, "device", None)
+        return bool(torch.cuda.is_available() and device is not None and str(device).startswith("cuda"))
 
     def count_tokens(self, messages: Sequence[dict[str, Any]]) -> int:
         encoded = self.tokenizer.apply_chat_template(

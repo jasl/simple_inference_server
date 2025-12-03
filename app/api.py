@@ -31,6 +31,7 @@ from app.concurrency.limiter import (
     limiter,
 )
 from app.dependencies import get_model_registry
+from app.models.base import ChatGeneration
 from app.models.registry import ModelRegistry
 from app.monitoring.metrics import (
     observe_audio_latency,
@@ -366,7 +367,7 @@ async def create_embeddings(
 
 
 @router.post("/v1/chat/completions", response_model=ChatCompletionResponse)
-async def create_chat_completions(  # noqa: PLR0915
+async def create_chat_completions(  # noqa: PLR0915, PLR0912
     req: ChatCompletionRequest,
     registry: Annotated[ModelRegistry, Depends(get_model_registry)],
     _request: Request,
@@ -428,27 +429,71 @@ async def create_chat_completions(  # noqa: PLR0915
 
             loop = asyncio.get_running_loop()
             executor = get_executor()
-            try:
-                generation = await loop.run_in_executor(
-                    executor,
-                    lambda: model.generate(
+            generation: ChatGeneration | None = None
+            batcher = getattr(_request.app.state, "chat_batching_service", None)
+            if (
+                batcher is not None
+                and getattr(batcher, "is_supported", lambda _m: False)(req.model)
+                and not has_images
+            ):
+                try:
+                    generation = await batcher.enqueue(
+                        req.model,
                         raw_messages,
                         max_new_tokens=max_tokens,
                         temperature=temperature,
                         top_p=top_p,
                         stop=stop,
-                    ),
-                )
-            except Exception as exc:  # pragma: no cover - unexpected runtime failure
+                    )
+                except ValueError as exc:
+                    record_chat_request(req.model, "400")
+                    raise HTTPException(
+                        status_code=status.HTTP_400_BAD_REQUEST,
+                        detail=str(exc),
+                    ) from exc
+                except RuntimeError as exc:
+                    # Chat batch queue is full
+                    record_chat_request(req.model, "429")
+                    raise HTTPException(
+                        status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+                        detail="Chat batch queue full",
+                        headers={"Retry-After": str(int(QUEUE_TIMEOUT_SEC))},
+                    ) from exc
+                except Exception as exc:  # pragma: no cover - defensive fallback
+                    logger.warning(
+                        "chat_batcher_failed_falling_back",
+                        extra={"model": req.model, "error": str(exc)},
+                    )
+                    generation = None
+
+            if generation is None:
+                try:
+                    generation = await loop.run_in_executor(
+                        executor,
+                        lambda: model.generate(
+                            raw_messages,
+                            max_new_tokens=max_tokens,
+                            temperature=temperature,
+                            top_p=top_p,
+                            stop=stop,
+                        ),
+                    )
+                except Exception as exc:  # pragma: no cover - unexpected runtime failure
+                    record_chat_request(req.model, "500")
+                    logger.exception(
+                        "chat_generation_failed",
+                        extra={"model": req.model, "max_tokens": max_tokens, "status": 500},
+                    )
+                    raise HTTPException(
+                        status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                        detail="Chat generation failed",
+                    ) from exc
+            if generation is None:
                 record_chat_request(req.model, "500")
-                logger.exception(
-                    "chat_generation_failed",
-                    extra={"model": req.model, "max_tokens": max_tokens, "status": 500},
-                )
                 raise HTTPException(
                     status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
                     detail="Chat generation failed",
-                ) from exc
+                )
     except QueueFullError as exc:
         record_chat_request(req.model, "429")
         raise HTTPException(

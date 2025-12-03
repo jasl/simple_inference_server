@@ -1,7 +1,7 @@
 import os
 from contextlib import suppress
 
-from prometheus_client import Counter, Histogram, make_asgi_app
+from prometheus_client import Counter, Gauge, Histogram, make_asgi_app
 from starlette.applications import Starlette
 
 REQUEST_COUNT = Counter(
@@ -28,6 +28,25 @@ CHAT_REQUEST_LATENCY = Histogram(
     "Chat/completion request latency in seconds",
     labelnames=("model",),
     buckets=(0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0, 20.0),
+)
+
+CHAT_BATCH_QUEUE = Gauge(
+    "chat_batch_queue_size",
+    "Current queue size for chat batching",
+    labelnames=("model",),
+)
+
+CHAT_BATCH_SIZE = Histogram(
+    "chat_batch_size",
+    "Number of requests in a chat batch",
+    labelnames=("model",),
+    buckets=(1, 2, 4, 6, 8, 12, 16, 24, 32),
+)
+
+CHAT_BATCH_OOM_RETRIES = Counter(
+    "chat_batch_oom_retries_total",
+    "Number of OOM retries triggered by chat batching",
+    labelnames=("model",),
 )
 
 AUDIO_REQUEST_COUNT = Counter(
@@ -86,6 +105,21 @@ def record_chat_request(model: str, status: str) -> None:
 def observe_chat_latency(model: str, seconds: float) -> None:
     with suppress(Exception):
         CHAT_REQUEST_LATENCY.labels(model=model).observe(seconds)
+
+
+def record_chat_batch_queue(model: str, size: int) -> None:
+    with suppress(Exception):
+        CHAT_BATCH_QUEUE.labels(model=model).set(size)
+
+
+def observe_chat_batch_size(model: str, size: int) -> None:
+    with suppress(Exception):
+        CHAT_BATCH_SIZE.labels(model=model).observe(size)
+
+
+def record_chat_batch_oom_retry(model: str) -> None:
+    with suppress(Exception):
+        CHAT_BATCH_OOM_RETRIES.labels(model=model).inc()
 
 
 def record_queue_rejection() -> None:

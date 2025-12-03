@@ -24,6 +24,7 @@ OpenAI-compatible inference API for small/edge models. Ships ready-to-run with F
   - Whisper via faster-whisper/CT2 for lower latency.
   - Chat via vLLM/TGI/llama.cpp backends while keeping the same `ChatModel` interface.
   - Embeddings via ONNX/TensorRT (e.g., bge, gemma) to cut CPU/GPU latency.
+- Chat continuous batching phase 2: streaming + user abort (phase 1 is in place; ideas recorded in `docs/continuous_batching.md`).
 - Add optional remote inference handler (HTTP/gRPC) implementing the same protocols for easy swapping.
 - Expand benchmarks to compare reference HF vs. high-performance variants under identical prompts/audio.
 
@@ -108,6 +109,7 @@ OpenAI-compatible inference API for small/edge models. Ships ready-to-run with F
 - `MODEL_DEVICE`: `cpu` | `mps` | `cuda` | `cuda:<idx>` | `auto` (default).
 - `AUTO_DOWNLOAD_MODELS` (default `1`): download selected models on startup; set to `0` to require pre-downloaded weights. Startup exits on download/load failure.
 - Chat generation defaults: per-model `defaults` (temperature/top_p/max_tokens) in the config; request args override.
+- Chat batching (text-only): `ENABLE_CHAT_BATCHING` (default `1`), `CHAT_BATCH_WINDOW_MS` (default `10` ms), `CHAT_BATCH_MAX_SIZE` (default `8`), `CHAT_MAX_PROMPT_TOKENS` (default `4096`), `CHAT_MAX_NEW_TOKENS` (default `2048`), `CHAT_BATCH_ALLOW_VISION` (default `0` keeps vision models on legacy path).
 - Vision fetch safety (Qwen3-VL): `ALLOW_REMOTE_IMAGES=0` (default), `REMOTE_IMAGE_TIMEOUT=5`, `MAX_REMOTE_IMAGE_BYTES=5242880`.
 - FP8 models need `accelerate`; non-FP8 variants avoid this dependency.
 
@@ -199,6 +201,7 @@ Embedding cache: repeated inputs are served from an in-memory LRU keyed by the f
 
 - **Concurrency gate**: `MAX_CONCURRENT` caps in-flight forwards and also sets threadpool size. On a single GPU/MPS start with 1–2; raise only if throughput improves while p99 stays acceptable.
 - **Micro-batching**: keep `ENABLE_BATCHING=1`; tune `BATCH_WINDOW_MS` (e.g., 4–10 ms) and `BATCH_WINDOW_MAX_SIZE` (8–16) to trade a few ms of queueing for higher throughput. Set `BATCH_WINDOW_MS=0` to disable coalescing.
+- **Chat batching (text-only)**: `ENABLE_CHAT_BATCHING=1` by default; tune `CHAT_BATCH_WINDOW_MS` (e.g., 4–10 ms) and `CHAT_BATCH_MAX_SIZE` (4–8). Guards: `CHAT_MAX_PROMPT_TOKENS` (default 4096) and `CHAT_MAX_NEW_TOKENS` (default 2048). Vision models stay on the legacy path unless `CHAT_BATCH_ALLOW_VISION=1`.
 - **Queueing**: `MAX_QUEUE_SIZE` controls how many requests can wait. Too large increases tail latency; too small yields 429s. Set per your SLA.
 - **Warmup**: keep `ENABLE_WARMUP=1`; for heavier models raise `WARMUP_STEPS` / `WARMUP_BATCH_SIZE` (e.g., 2–3 steps, batch 4–8). Restart after changing models or devices.
 - **Device choice**: set `MODEL_DEVICE` (`cuda`, `cuda:<idx>`, `mps`, `cpu`). On macOS MPS, performance varies with temperature/power; on CUDA you can try `MAX_CONCURRENT=2–4`.
