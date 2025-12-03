@@ -1,19 +1,89 @@
 # Simple Inference Server
 
-A straightforward OpenAI-compatible inference API server for hosting multiple small models at the edge.
-Built with FastAPI, PyTorch, and Hugging Face Transformers.
+OpenAI-compatible inference API for small/edge models. Ships ready-to-run with FastAPI + PyTorch + Hugging Face, supporting embeddings and chat (text + vision for Qwen3-VL).
+
+## What you can do
+
+- Serve multiple local HF models behind OpenAI-style endpoints.
+- Get embeddings via `/v1/embeddings`.
+- Chat via `/v1/chat/completions` (Qwen3-VL supports image inputs).
+- Observe with `/metrics`, guard with batching/backpressure, and list models with `/v1/models`.
+
+## Requirements
+
+- Python ≥ 3.12
+- Local model weights (downloaded ahead of time)
+- For FP8 models or `device_map=auto`: `accelerate` (already in deps)
+
+## Quick start
+
+1) Install deps  
+
+   ```bash
+   uv sync
+   ```
+
+2) Download the models you plan to load (example: embeddings + small chat)  
+
+   ```bash
+   MODELS=bge-m3,llama-3.2-1b-instruct uv run python scripts/download_models.py
+   ```
+
+3) Run the server  
+
+   ```bash
+   MODELS=bge-m3,llama-3.2-1b-instruct uv run python scripts/run_dev.py --device auto
+   ```
+
+4) Call the API  
+   - Embedding:
+
+     ```bash
+     curl -X POST http://localhost:8000/v1/embeddings \
+       -H "Content-Type: application/json" \
+       -d '{"model":"bge-m3","input":"hello world"}'
+     ```
+
+   - Chat (text only, small model):
+
+     ```bash
+     curl -X POST http://localhost:8000/v1/chat/completions \
+       -H "Content-Type: application/json" \
+       -d '{"model":"llama-3.2-1b-instruct","messages":[{"role":"user","content":"Who are you?"}],"max_tokens":128}'
+     ```
+
+   - Chat with image (Qwen3-VL):
+
+     ```bash
+     curl -X POST http://localhost:8000/v1/chat/completions \
+       -H "Content-Type: application/json" \
+       -d '{
+             "model": "qwen3-vl-4b-instruct",
+             "messages": [
+               {"role": "user", "content": [
+                 {"type": "image_url", "image_url": {"url": "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAA...truncated..."}},
+                 {"type": "text", "text": "Describe the cat."}
+               ]}
+             ],
+             "max_tokens": 128
+           }'
+     ```
+
+## Configuration highlights
+
+- `MODELS` (required): comma-separated model IDs from `configs/model_config.yaml`.
+- `MODEL_DEVICE`: `cpu` | `mps` | `cuda` | `cuda:<idx>` | `auto` (default).
+- Chat generation defaults: per-model `defaults` (temperature/top_p/max_tokens) in the config; request args override.
+- Vision fetch safety (Qwen3-VL): `ALLOW_REMOTE_IMAGES=0` (default), `REMOTE_IMAGE_TIMEOUT=5`, `MAX_REMOTE_IMAGE_BYTES=5242880`.
+- FP8 models need `accelerate`; non-FP8 variants avoid this dependency.
 
 ## Features
 
-- OpenAI-compatible `POST /v1/embeddings`
-- Health check `GET /health`
-- Optional Prometheus metrics at `/metrics`
-- Preloaded, offline models (no runtime downloads)
-- In-memory LRU cache for recent embeddings (configurable)
-- Bounded concurrency with 429 backpressure
-- Model list `GET /v1/models` (OpenAI-compatible)
-- Batch and input guards: `MAX_BATCH_SIZE` (default 32), `MAX_TEXT_CHARS` (default 20000)
-- Usage accounting: prompt/total tokens when tokenizer is available
+- OpenAI-compatible embeddings and chat endpoints (non-streaming)
+- Vision input for Qwen3-VL (optional remote image fetch, see envs below)
+- Prometheus metrics, health checks, model listing
+- Micro-batching for embeddings, bounded concurrency and request guards
+- Offline-first: loads only local weights; HF cache under `./models` by default
 
 ## Built-in models (catalog)
 
@@ -23,6 +93,18 @@ All supported models are defined in `configs/model_config.yaml` (kept as the cat
 | --- | --- | --- |
 | `bge-m3` | `BAAI/bge-m3` | `app.models.bge_m3.BgeM3Embedding` |
 | `embedding-gemma-300m` | `google/embeddinggemma-300m` | `app.models.embedding_gemma.EmbeddingGemmaEmbedding` |
+| `qwen3-vl-4b-instruct-fp8` | `Qwen/Qwen3-VL-4B-Instruct-FP8` | `app.models.qwen_vl.QwenVLChat` |
+| `qwen3-vl-2b-instruct-fp8` | `Qwen/Qwen3-VL-2B-Instruct-FP8` | `app.models.qwen_vl.QwenVLChat` |
+| `qwen3-vl-4b-instruct` | `Qwen/Qwen3-VL-4B-Instruct` | `app.models.qwen_vl.QwenVLChat` |
+| `qwen3-vl-2b-instruct` | `Qwen/Qwen3-VL-2B-Instruct` | `app.models.qwen_vl.QwenVLChat` |
+| `qwen3-4b-instruct-2507` | `Qwen/Qwen3-4B-Instruct-2507` | `app.models.text_chat.TextChatModel` |
+| `qwen3-4b-instruct-2507-fp8` | `Qwen/Qwen3-4B-Instruct-2507-FP8` | `app.models.text_chat.TextChatModel` |
+| `llama-3.2-1b-instruct` | `meta-llama/Llama-3.2-1B-Instruct` | `app.models.text_chat.TextChatModel` |
+| `llama-3.2-3b-instruct` | `meta-llama/Llama-3.2-3B-Instruct` | `app.models.text_chat.TextChatModel` |
+
+FP8 Qwen3-VL models require `accelerate` (added to dependencies). If you prefer non-quantized weights, swap the repos to `Qwen/Qwen3-VL-4B-Instruct` or `Qwen/Qwen3-VL-2B-Instruct` in `configs/model_config.yaml`; all other logic remains the same.
+
+Per-model generation defaults (temperature / top_p / max_tokens) can be set in `configs/model_config.yaml` under a `defaults` block; request parameters override these defaults.
 
 ## API endpoints
 
@@ -30,6 +112,12 @@ All supported models are defined in `configs/model_config.yaml` (kept as the cat
   - `model` (string): one of the names in `configs/model_config.yaml`
   - `input` (string or array of strings): text to embed
   - `encoding_format` (optional, default `"float"`): only `"float"` is supported
+- `POST /v1/chat/completions`: OpenAI-compatible chat API (non-streaming). Body:
+  - `model` (string): chat-capable model id
+  - `messages` (array): OpenAI messages; supports multi-modal `image_url` parts for Qwen3-VL models
+  - `max_tokens` (optional; falls back to per-model default then env `MAX_NEW_TOKENS` → 512)
+  - `temperature`, `top_p`, `stop`, `user` as in OpenAI; `n` must be 1; `stream` is not yet supported
+  - `top_k` is intentionally unsupported for OpenAI compatibility
 - `GET /v1/models`: List loaded models with id, owner, and embedding dimensions.
 - `GET /health`: Liveness/readiness check; returns 503 if the registry is not ready.
 - `GET /metrics`: Prometheus metrics (enabled by default; toggle via `ENABLE_METRICS`).
@@ -41,9 +129,9 @@ uv sync
 ```
 
 ```bash
-MODELS= uv run python scripts/run_dev.py --config configs/model_config.yaml --device auto
+MODELS=bge-m3 uv run python scripts/run_dev.py --device auto
 # MODELS must be set (comma-separated). Alternatively:
-# uv run python scripts/run_dev.py --models bge-m3,embedding-gemma-300m
+# uv run python scripts/run_dev.py --models bge-m3,llama-3.2-1b-instruct
 ```
 
 Default model cache is locked to the repo-local `models/` directory. Pre-download models via `scripts/download_models.py` (always writes to `models/`) before building or running the service. For private/licensed models, set `HF_TOKEN` only when running the download script; the runtime uses local files only.
@@ -95,6 +183,45 @@ Expected response shape (truncated):
 }
 ```
 
+Chat completion with an image (Qwen3-VL):
+
+```bash
+curl -X POST http://localhost:8000/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -d '{
+        "model": "qwen3-vl-4b-instruct-fp8",
+        "messages": [
+          {"role": "user", "content": [
+            {"type": "image_url", "image_url": {"url": "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAA...truncated..."}},
+            {"type": "text", "text": "Describe this cat in detail."}
+          ]}
+        ],
+        "max_tokens": 128
+      }'
+```
+
+Basic chat (text only):
+
+```bash
+curl -X POST http://localhost:8000/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -d '{
+        "model": "llama-3.2-1b-instruct",
+        "messages": [
+          {"role": "user", "content": "Who are you?"}
+        ],
+        "max_tokens": 128,
+        "temperature": 0.7
+      }'
+```
+
+## Benchmarking
+
+- Embeddings: `uv run python scripts/benchmark_embeddings.py --models bge-m3 --n-requests 50 --concurrency 8`
+- Chat: `uv run python scripts/benchmark_chat.py --model-name llama-3.2-1b-instruct --prompt "Explain FP8 quantization" --n-requests 40 --concurrency 8`
+
+Both scripts also accept environment overrides (e.g., `BASE_URL`, `MODEL_NAME`, `PROMPT`, `N_REQUESTS`, `CONCURRENCY`).
+
 ## Adding a new model
 
 1. **Implement a handler**: Create `app/models/<your_model>.py` implementing `EmbeddingModel` (see `bge_m3.py` / `embedding_gemma.py` for reference). Set `capabilities` on the handler (e.g., `["text-embedding"]`). Use `cache_dir` pointing to `models/` (or `HF_HOME` fallback) and `local_files_only=True`.
@@ -117,6 +244,7 @@ Unsupported or unregistered `model` values return `404 Model not found`. Be sure
   - `POST /embedding`: generate embedding of a given text
   - `POST /embeddings`: non-OpenAI-compatible embeddings API
   - `POST /reranking`: rerank documents according to a given query
+- OpenAI-style streaming chat completions (SSE/chunked responses)
 - Request/trace IDs: include a per-request ID in logs and responses for easier tracing.
 
 ## License

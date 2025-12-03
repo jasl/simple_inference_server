@@ -17,6 +17,19 @@ REQUEST_LATENCY = Histogram(
     buckets=(0.01, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0),
 )
 
+CHAT_REQUEST_COUNT = Counter(
+    "chat_requests_total",
+    "Total number of chat/completion requests",
+    labelnames=("model", "status"),
+)
+
+CHAT_REQUEST_LATENCY = Histogram(
+    "chat_request_latency_seconds",
+    "Chat/completion request latency in seconds",
+    labelnames=("model",),
+    buckets=(0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0, 20.0),
+)
+
 QUEUE_REJECTIONS = Counter(
     "embedding_queue_rejections_total",
     "Requests rejected due to queue limits",
@@ -50,6 +63,16 @@ def record_request(model: str, status: str) -> None:
 def observe_latency(model: str, seconds: float) -> None:
     with suppress(Exception):
         REQUEST_LATENCY.labels(model=model).observe(seconds)
+
+
+def record_chat_request(model: str, status: str) -> None:
+    with suppress(Exception):
+        CHAT_REQUEST_COUNT.labels(model=model, status=status).inc()
+
+
+def observe_chat_latency(model: str, seconds: float) -> None:
+    with suppress(Exception):
+        CHAT_REQUEST_LATENCY.labels(model=model).observe(seconds)
 
 
 def record_queue_rejection() -> None:

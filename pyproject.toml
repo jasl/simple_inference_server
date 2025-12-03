@@ -12,11 +12,15 @@ dependencies = [
   "pydantic>=2.12.5",
   "numpy>=2.3.5",
   "torch>=2.9.1",
+  "torchvision",
+  "torchaudio",
   "transformers>=4.57.3",
+  "accelerate>=1.12.0",
   "huggingface-hub>=0.36.0",
   "prometheus-client>=0.23.1",
   "pyyaml>=6.0.3",
-  "python-dotenv>=1.2.1"
+  "python-dotenv>=1.2.1",
+  "pillow>=12.0.0"
 ]
 
 [project.optional-dependencies]
@@ -43,6 +47,12 @@ dev = [
 # NOTE: We must explicitly request them as `dependencies` above. These improved
 # versions will not be selected if they're only third-party dependencies.
 torch = [
+  { index = "pytorch-cuda", marker = "sys_platform == 'linux' or sys_platform == 'win32'" },
+]
+torchaudio = [
+  { index = "pytorch-cuda", marker = "sys_platform == 'linux' or sys_platform == 'win32'" },
+]
+torchvision = [
   { index = "pytorch-cuda", marker = "sys_platform == 'linux' or sys_platform == 'win32'" },
 ]
 

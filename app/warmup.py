@@ -34,6 +34,8 @@ def warm_up_models(registry: ModelRegistry) -> None:
 
     for name in registry.list_models():
         model = registry.get(name)
+        if "text-embedding" not in getattr(model, "capabilities", []):
+            continue
         device = getattr(model, "device", None)
 
         try:

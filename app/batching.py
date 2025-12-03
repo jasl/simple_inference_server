@@ -105,7 +105,8 @@ class BatchingService:
         self._batchers: dict[str, ModelBatcher] = {}
         for name in registry.list_models():
             model = registry.get(name)
-            self._batchers[name] = ModelBatcher(model, self.max_batch_size, self.window_ms)
+            if "text-embedding" in getattr(model, "capabilities", []):
+                self._batchers[name] = ModelBatcher(model, self.max_batch_size, self.window_ms)
 
     async def enqueue(self, model_name: str, texts: list[str]) -> np.ndarray:
         if not self.enabled:

@@ -1,9 +1,12 @@
+import importlib.util
 import logging
 import os
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from pathlib import Path
 
+import torch
+import yaml
 from dotenv import load_dotenv
 from fastapi import FastAPI
 
@@ -38,6 +41,7 @@ def startup() -> tuple[ModelRegistry, BatchingService]:
         raise SystemExit(
             "No models specified. Set MODELS env (comma-separated) before starting the service."
         )
+    _warn_if_accelerate_missing(config_path, model_allowlist)
     try:
         registry = ModelRegistry(
             config_path,
@@ -94,6 +98,40 @@ def startup() -> tuple[ModelRegistry, BatchingService]:
     return registry, batching_service
 
 
+def _warn_if_accelerate_missing(config_path: str, allowlist: list[str] | None) -> None:
+    """Pre-flight warning if FP8 models are configured but accelerate is absent."""
+
+    try:
+        with Path(config_path).open() as f:
+            cfg = yaml.safe_load(f) or {}
+    except Exception:  # pragma: no cover - non-critical
+        return
+
+    requested = set(allowlist) if allowlist else None
+    fp8_models: list[str] = []
+    for item in cfg.get("models", []):
+        name = item.get("name")
+        if not name:
+            continue
+        if requested is not None and name not in requested:
+            continue
+        repo = str(item.get("hf_repo_id", "")).lower()
+        if "fp8" in repo:
+            fp8_models.append(name)
+
+    if fp8_models:
+        if importlib.util.find_spec("accelerate") is None:
+            logger.warning(
+                "FP8 models %s require 'accelerate'. Install it or switch to non-FP8 repos.",
+                fp8_models,
+            )
+        if not torch.cuda.is_available() and not getattr(torch, "xpu", None):
+            logger.warning(
+                "FP8 models %s require a GPU/XPU runtime. Select non-FP8 variants or run on GPU.",
+                fp8_models,
+            )
+
+
 async def shutdown(batching_service: BatchingService | None) -> None:
     stop_accepting()
     await wait_for_drain()
@@ -118,5 +156,5 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         await shutdown(batching_service)
 
 
-app = FastAPI(title="Embedding Service", lifespan=lifespan)
+app = FastAPI(title="Inference Service", lifespan=lifespan)
 app.include_router(api_router)
