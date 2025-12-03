@@ -17,7 +17,7 @@ from app.monitoring.metrics import (
     record_chat_batch_oom_retry,
     record_chat_batch_queue,
 )
-from app.threadpool import get_executor
+from app.threadpool import get_chat_executor
 
 logger = logging.getLogger(__name__)
 _COUNT_EXECUTOR = ThreadPoolExecutor(max_workers=2, thread_name_prefix="chat-count")
@@ -94,7 +94,7 @@ class ChatBatcher:
 
     async def _worker(self) -> None:  # noqa: PLR0912 - batching loop keeps several branches for fairness/backpressure
         loop = asyncio.get_running_loop()
-        executor = get_executor()
+        executor = get_chat_executor()
         try:
             while True:
                 first = await self.queue.get()

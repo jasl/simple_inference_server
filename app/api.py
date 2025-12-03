@@ -41,7 +41,7 @@ from app.monitoring.metrics import (
     record_chat_request,
     record_request,
 )
-from app.threadpool import get_executor
+from app.threadpool import get_chat_executor, get_embedding_executor
 
 router = APIRouter()
 logger = logging.getLogger(__name__)
@@ -305,7 +305,7 @@ async def create_embeddings(
                     vectors = await batcher.enqueue(req.model, texts)
                 else:
                     loop = asyncio.get_running_loop()
-                    executor = get_executor()
+                    executor = get_embedding_executor()
                     vectors = await loop.run_in_executor(executor, model.embed, texts)
             except Exception as exc:  # pragma: no cover - unexpected runtime failure
                 record_request(req.model, "500")
@@ -428,7 +428,7 @@ async def create_chat_completions(  # noqa: PLR0915, PLR0912
             top_p = req.top_p if req.top_p is not None else top_p_default
 
             loop = asyncio.get_running_loop()
-            executor = get_executor()
+            executor = get_chat_executor()
             generation: ChatGeneration | None = None
             batcher = getattr(_request.app.state, "chat_batching_service", None)
             if (
@@ -600,7 +600,7 @@ async def _handle_audio_request(  # noqa: PLR0912, PLR0913, PLR0915
                 )
 
             loop = asyncio.get_running_loop()
-            executor = get_executor()
+            executor = get_chat_executor()
             try:
                 result = await loop.run_in_executor(
                     executor,

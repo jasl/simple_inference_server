@@ -22,7 +22,7 @@ from app.concurrency.limiter import stop_accepting, wait_for_drain
 from app.logging_config import setup_logging
 from app.models.registry import ModelRegistry
 from app.monitoring.metrics import setup_metrics
-from app.threadpool import shutdown_executor
+from app.threadpool import shutdown_executors
 from app.warmup import warm_up_models
 
 logger = logging.getLogger(__name__)
@@ -230,7 +230,7 @@ async def shutdown(
     if chat_batching_service is not None:
         await chat_batching_service.stop()
         state.chat_batching_service = None
-    shutdown_executor()
+    shutdown_executors()
 
 
 @asynccontextmanager

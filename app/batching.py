@@ -9,7 +9,7 @@ from typing import Any
 import numpy as np
 
 from app.models.registry import ModelRegistry
-from app.threadpool import get_executor
+from app.threadpool import get_embedding_executor
 
 
 class _BatchItem:
@@ -38,7 +38,7 @@ class ModelBatcher:
 
     async def _worker(self) -> None:
         loop = asyncio.get_running_loop()
-        executor = get_executor()
+        executor = get_embedding_executor()
         while True:
             item = await self.queue.get()
             batch_items = [item]

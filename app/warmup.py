@@ -8,7 +8,7 @@ from concurrent.futures import wait
 import torch
 
 from app.models.registry import ModelRegistry
-from app.threadpool import get_executor
+from app.threadpool import get_embedding_executor
 
 logger = logging.getLogger(__name__)
 
@@ -29,7 +29,7 @@ def warm_up_models(registry: ModelRegistry) -> None:
     steps = int(os.getenv("WARMUP_STEPS", "1"))
     texts = ["hello world"] * batch_size
 
-    executor = get_executor()
+    executor = get_embedding_executor()
     workers = max(1, getattr(executor, "_max_workers", 1))
 
     for name in registry.list_models():
