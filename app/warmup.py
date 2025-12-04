@@ -3,13 +3,15 @@ from __future__ import annotations
 import logging
 import os
 import time
-from concurrent.futures import wait
-from contextlib import nullcontext
-from typing import Iterable, Iterator
+from collections.abc import Iterable
+from concurrent.futures import ThreadPoolExecutor, wait
+from contextlib import AbstractContextManager, nullcontext
+from typing import cast
 
 import torch
 
 from app.concurrency.limiter import MAX_CONCURRENT
+from app.models.base import EmbeddingModel
 from app.models.registry import ModelRegistry
 from app.threadpool import get_embedding_executor
 
@@ -121,20 +123,21 @@ def warm_up_models(registry: ModelRegistry) -> None:
 
 
 def _run_warmup_step(
-    model: object,
+    model: EmbeddingModel,
     texts: Iterable[str],
     workers: int,
     use_inference_mode: bool,
-    executor: object,
+    executor: ThreadPoolExecutor,
 ) -> None:
     context = _inference_context(enabled=use_inference_mode)
+    text_batch = list(texts)
     if workers <= 1:
         with context:
-            model.embed(texts)
+            model.embed(text_batch)
         return
 
     futures = [
-        executor.submit(_embed_once, model, list(texts), use_inference_mode)
+        executor.submit(_embed_once, model, text_batch, use_inference_mode)
         for _ in range(workers)
     ]
     wait(futures)
@@ -142,17 +145,17 @@ def _run_warmup_step(
         fut.result()
 
 
-def _embed_once(model: object, texts: list[str], use_inference_mode: bool) -> None:
+def _embed_once(model: EmbeddingModel, texts: list[str], use_inference_mode: bool) -> None:
     with _inference_context(enabled=use_inference_mode):
         model.embed(texts)
 
 
-def _inference_context(enabled: bool) -> Iterator[None]:
+def _inference_context(enabled: bool) -> AbstractContextManager[None]:
     if not enabled:
         return nullcontext()
     if hasattr(torch, "inference_mode"):
-        return torch.inference_mode()
-    return torch.no_grad()
+        return cast(AbstractContextManager[None], torch.inference_mode())
+    return cast(AbstractContextManager[None], torch.no_grad())
 
 
 def _select_worker_count(

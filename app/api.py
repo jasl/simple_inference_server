@@ -42,8 +42,8 @@ from app.monitoring.metrics import (
     record_request,
 )
 from app.threadpool import get_chat_executor, get_embedding_executor
-from app.warmup import get_failed_warmups
 from app.utils.uploads import chunked_upload_to_tempfile
+from app.warmup import get_failed_warmups
 
 router = APIRouter()
 logger = logging.getLogger(__name__)
