@@ -49,6 +49,12 @@ CHAT_BATCH_OOM_RETRIES = Counter(
     labelnames=("model",),
 )
 
+CHAT_BATCH_QUEUE_REJECTIONS = Counter(
+    "chat_batch_queue_rejections_total",
+    "Requests rejected due to chat batch queue limits",
+    labelnames=("model",),
+)
+
 AUDIO_REQUEST_COUNT = Counter(
     "audio_requests_total",
     "Total number of audio transcription/translation requests",
@@ -120,6 +126,11 @@ def observe_chat_batch_size(model: str, size: int) -> None:
 def record_chat_batch_oom_retry(model: str) -> None:
     with suppress(Exception):
         CHAT_BATCH_OOM_RETRIES.labels(model=model).inc()
+
+
+def record_chat_batch_queue_rejection(model: str) -> None:
+    with suppress(Exception):
+        CHAT_BATCH_QUEUE_REJECTIONS.labels(model=model).inc()
 
 
 def record_queue_rejection() -> None:

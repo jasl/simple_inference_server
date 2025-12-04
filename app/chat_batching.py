@@ -16,6 +16,7 @@ from app.monitoring.metrics import (
     observe_chat_batch_size,
     record_chat_batch_oom_retry,
     record_chat_batch_queue,
+    record_chat_batch_queue_rejection,
 )
 from app.threadpool import get_chat_executor
 
@@ -37,6 +38,10 @@ class _ChatBatchItem:
     @property
     def config_key(self) -> tuple[float, float, int, tuple[str, ...]]:
         return (self.temperature, self.top_p, self.max_new_tokens, self.stop)
+
+
+class ChatBatchQueueFullError(Exception):
+    """Raised when the chat batch queue is full."""
 
 
 class ChatBatcher:
@@ -93,7 +98,16 @@ class ChatBatcher:
         try:
             self.queue.put_nowait(item)
         except asyncio.QueueFull as exc:
-            raise RuntimeError("Chat batch queue is full") from exc
+            record_chat_batch_queue_rejection(self.model_name)
+            logger.warning(
+                "chat_batch_queue_full",
+                extra={
+                    "model": self.model_name,
+                    "queue_size": self.queue.qsize(),
+                    "max_queue_size": self.queue.maxsize,
+                },
+            )
+            raise ChatBatchQueueFullError("Chat batch queue is full") from exc
         return await fut
 
     async def _worker(self) -> None:  # noqa: PLR0912 - batching loop keeps several branches for fairness/backpressure
