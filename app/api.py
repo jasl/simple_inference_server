@@ -2,7 +2,6 @@ import asyncio
 import contextlib
 import logging
 import os
-import tempfile
 import time
 from collections.abc import Sequence
 from pathlib import Path
@@ -43,10 +42,12 @@ from app.monitoring.metrics import (
     record_request,
 )
 from app.threadpool import get_chat_executor, get_embedding_executor
+from app.utils.uploads import chunked_upload_to_tempfile
 
 router = APIRouter()
 logger = logging.getLogger(__name__)
 MAX_AUDIO_BYTES = int(os.getenv("MAX_AUDIO_BYTES", str(25 * 1024 * 1024)))  # default 25MB
+UPLOAD_CHUNK_BYTES = 1024 * 1024  # 1MB chunks
 
 
 class EmbeddingRequest(BaseModel):
@@ -174,20 +175,17 @@ def _normalize_stop(stop: str | list[str] | None) -> list[str] | None:
 
 async def _save_upload(file: UploadFile, max_bytes: int = MAX_AUDIO_BYTES) -> tuple[str, int]:
     """Persist UploadFile to a temp file and enforce size guard."""
-
-    data = await file.read()
-    size = len(data)
-    if max_bytes and size > max_bytes:
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail=f"Audio file too large; max {max_bytes} bytes",
-        )
     suffix = Path(file.filename or "").suffix or ".wav"
-    with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as tmp:
-        tmp.write(data)
-        tmp.flush()
-        tmp_path = tmp.name
-    return tmp_path, size
+    return await chunked_upload_to_tempfile(
+        file,
+        chunk_size=UPLOAD_CHUNK_BYTES,
+        max_bytes=max_bytes,
+        suffix=suffix,
+        on_exceed=lambda limit, size: HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"Audio file too large; max {limit} bytes",
+        ),
+    )
 
 
 def _probe_duration(path: str) -> float | None:
