@@ -113,3 +113,16 @@ disallow_untyped_defs = true
 check_untyped_defs = true
 ignore_missing_imports = true
 exclude = ["models"]
+
+[[tool.mypy.overrides]]
+module = [
+  "torch.*",
+  "transformers.*",
+  "PIL.*",
+  "numpy.*",
+  "httpx.*",
+  "starlette.*",
+  "fastapi.*",
+]
+follow_imports = "skip"
+ignore_missing_imports = true

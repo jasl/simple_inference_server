@@ -3,6 +3,7 @@
 import asyncio
 import os
 import time
+from typing import cast
 
 import httpx
 import numpy as np
@@ -66,7 +67,8 @@ async def run() -> None:
 
     if results:
         arr = np.array(results)
-        p50, p90, p99 = np.percentile(arr, [50, 90, 99])
+        percentiles = cast(list[float], np.percentile(arr, [50, 90, 99]).tolist())
+        p50, p90, p99 = percentiles
         print(f"Latency p50={p50:.3f}s p90={p90:.3f}s p99={p99:.3f}s")
         print(f"Throughput ≈ {len(results) / arr.sum():.2f} req/s")
     if errors:
