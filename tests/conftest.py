@@ -6,7 +6,8 @@ import contextlib
 import importlib.machinery
 import sys
 import types
-from typing import Any, Iterator
+from collections.abc import Iterator
+from typing import Any
 
 # Several tests (and third-party imports) look for torchaudio. Provide a minimal
 # stub with a ModuleSpec so importlib.util.find_spec works without the real
