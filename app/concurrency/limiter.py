@@ -26,6 +26,15 @@ _semaphore: asyncio.Semaphore = asyncio.Semaphore(MAX_CONCURRENT)
 _queue: asyncio.Queue[int] = asyncio.Queue(MAX_QUEUE_SIZE)
 _state = {"accepting": True}
 _in_flight_count = 0
+_drain_event: asyncio.Event = asyncio.Event()
+_drain_event.set()
+
+
+def _update_drain_event() -> None:
+    if _queue.qsize() == 0 and _in_flight_count == 0:
+        _drain_event.set()
+    else:
+        _drain_event.clear()
 
 
 @asynccontextmanager
@@ -35,6 +44,7 @@ async def limiter() -> AsyncIterator[None]:
         raise ShuttingDownError("Service is shutting down")
     try:
         _queue.put_nowait(1)
+        _update_drain_event()
     except asyncio.QueueFull as exc:  # queue already at capacity
         record_queue_rejection()
         raise QueueFullError("Request queue is full") from exc
@@ -48,13 +58,16 @@ async def limiter() -> AsyncIterator[None]:
 
         try:
             _in_flight_count += 1
+            _update_drain_event()
             yield
         finally:
             _in_flight_count -= 1
             _semaphore.release()
+            _update_drain_event()
     finally:
         _queue.get_nowait()
         _queue.task_done()
+        _update_drain_event()
 
 
 def stop_accepting() -> None:
@@ -66,8 +79,12 @@ async def wait_for_drain(timeout: float = 5.0) -> None:
     """Wait for in-flight work to finish, with a timeout."""
     deadline = asyncio.get_event_loop().time() + timeout
     while True:
-        if _queue.qsize() == 0 and _in_flight_count == 0:
+        if _drain_event.is_set():
             break
-        if asyncio.get_event_loop().time() >= deadline:
+        remaining = deadline - asyncio.get_event_loop().time()
+        if remaining <= 0:
             break
-        await asyncio.sleep(0.05)
+        try:
+            await asyncio.wait_for(_drain_event.wait(), timeout=remaining)
+        except asyncio.TimeoutError:
+            break
