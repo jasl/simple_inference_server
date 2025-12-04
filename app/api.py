@@ -42,6 +42,7 @@ from app.monitoring.metrics import (
     record_request,
 )
 from app.threadpool import get_chat_executor, get_embedding_executor
+from app.warmup import get_failed_warmups
 from app.utils.uploads import chunked_upload_to_tempfile
 
 router = APIRouter()
@@ -256,6 +257,7 @@ class ModelsResponse(BaseModel):
 class HealthResponse(BaseModel):
     status: str
     models: list[str] | None = None
+    warmup_failures: list[str] | None = None
 
 
 @router.post("/v1/embeddings", response_model=EmbeddingResponse)
@@ -774,4 +776,5 @@ async def health(
         models = registry.list_models()
     except Exception as exc:  # pragma: no cover
         raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail="Registry unavailable") from exc
-    return HealthResponse(status="ok", models=models)
+    failures = get_failed_warmups()
+    return HealthResponse(status="ok", models=models, warmup_failures=failures or None)
