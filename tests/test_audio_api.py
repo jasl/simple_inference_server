@@ -1,13 +1,41 @@
 import io
+import sys
+import tempfile
+import types
 import wave
+from pathlib import Path
+from typing import Any
 
 import pytest
-from fastapi import FastAPI, UploadFile
+from fastapi import FastAPI, HTTPException, UploadFile
 from fastapi.testclient import TestClient
 
-from app import api
-from app.dependencies import get_model_registry
-from app.models.base import SpeechResult, SpeechSegment
+
+class _DummyCuda:
+    class OutOfMemoryError(RuntimeError):
+        pass
+
+    @staticmethod
+    def is_available() -> bool:
+        return False
+
+    @staticmethod
+    def empty_cache() -> None:  # pragma: no cover - noop for tests
+        return None
+
+
+_torch_stub: Any = types.ModuleType("torch")
+_torch_stub.cuda = _DummyCuda
+_torch_stub.OutOfMemoryError = _DummyCuda.OutOfMemoryError
+sys.modules.setdefault("torch", _torch_stub)
+
+_torchaudio_stub: Any = types.ModuleType("torchaudio")
+_torchaudio_stub.info = lambda _path: types.SimpleNamespace(num_frames=0, sample_rate=0)
+sys.modules.setdefault("torchaudio", _torchaudio_stub)
+
+from app import api  # noqa: E402
+from app.dependencies import get_model_registry  # noqa: E402
+from app.models.base import SpeechResult, SpeechSegment  # noqa: E402
 
 HTTP_OK = 200
 HTTP_BAD_REQUEST = 400
@@ -162,3 +190,43 @@ def test_audio_size_limit(monkeypatch: pytest.MonkeyPatch) -> None:
         files={"file": ("audio.wav", wav_bytes, "audio/wav")},
     )
     assert resp.status_code == HTTP_BAD_REQUEST
+
+
+@pytest.mark.asyncio
+async def test_save_upload_streams_and_persists(monkeypatch: pytest.MonkeyPatch) -> None:
+    data = b"stream-me" * 4
+    upload = UploadFile(filename="audio.wav", file=io.BytesIO(data))
+
+    monkeypatch.setattr(api, "UPLOAD_CHUNK_BYTES", 4)
+
+    path, size = await api._save_upload(upload, max_bytes=len(data) + 10)
+    assert size == len(data)
+
+    saved = Path(path).read_bytes()
+    Path(path).unlink()
+
+    assert saved == data
+
+
+@pytest.mark.asyncio
+async def test_save_upload_removes_temp_on_limit(monkeypatch: pytest.MonkeyPatch) -> None:
+    data = b"0123456789"
+    upload = UploadFile(filename="audio.wav", file=io.BytesIO(data))
+
+    recorded_paths: list[str] = []
+    original_tempfile = tempfile.NamedTemporaryFile
+
+    def tracking_tempfile(*args: Any, **kwargs: Any) -> tempfile._TemporaryFileWrapper[bytes]:
+        tmp = original_tempfile(*args, **kwargs)
+        recorded_paths.append(tmp.name)
+        return tmp
+
+    monkeypatch.setattr(tempfile, "NamedTemporaryFile", tracking_tempfile)
+    monkeypatch.setattr(api, "UPLOAD_CHUNK_BYTES", 4)
+
+    with pytest.raises(HTTPException) as excinfo:
+        await api._save_upload(upload, max_bytes=5)
+
+    assert excinfo.value.status_code == HTTP_BAD_REQUEST
+    for path in recorded_paths:
+        assert not Path(path).exists()
