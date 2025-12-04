@@ -191,7 +191,14 @@ MODELS=BAAI/bge-m3 uv run python scripts/run_dev.py --device auto
 
 Default model cache is locked to the repo-local `models/` directory. Pre-download models via `scripts/download_models.py` (always writes to `models/`) before building or running the service. For private/licensed models, set `HF_TOKEN` only when running the download script; the runtime uses local files only.
 
-Environment variables can be kept in a `.env` file (see `.env.example`) and are loaded on startup without overriding existing variables. Startup performs an optional warmup for each model (toggle via `ENABLE_WARMUP`, default on): it runs a batch through every executor worker to initialize per-thread tokenizers and compile kernels. Control batch and repetitions with `WARMUP_BATCH_SIZE` and `WARMUP_STEPS`.
+Environment variables can be kept in a `.env` file (see `.env.example`) and are loaded on startup without overriding existing variables. Startup performs an optional warmup for each model (toggle via `ENABLE_WARMUP`, default on): it runs a batch through every executor worker across all capabilities (embeddings, chat, vision, rerank) to initialize per-thread tokenizers and compile kernels.
+
+Warmup controls:
+- `WARMUP_BATCH_SIZE` / `WARMUP_STEPS`: adjust batch and repetitions.
+- `WARMUP_INFERENCE_MODE` (default `1`): use `torch.inference_mode()` / `no_grad` during warmup.
+- `WARMUP_VRAM_BUDGET_MB` / `WARMUP_VRAM_PER_WORKER_MB`: limit concurrent warmup workers based on memory headroom.
+- `WARMUP_ALLOWLIST` / `WARMUP_SKIPLIST`: include or skip specific models.
+- `REQUIRE_WARMUP_SUCCESS` (default `0`): fail startup if any model warmup fails.
 
 Request batching: by default the server can micro-batch concurrent embedding requests. Configure via `ENABLE_BATCHING` (default on), `BATCH_WINDOW_MS` (collection window), and `BATCH_WINDOW_MAX_SIZE` (max combined batch). Set `BATCH_WINDOW_MS=0` to effectively disable coalescing.
 
