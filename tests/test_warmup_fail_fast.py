@@ -1,4 +1,5 @@
 
+import threading
 from pathlib import Path
 from typing import Any
 
@@ -15,7 +16,7 @@ class FailingModel(EmbeddingModel):
     device = "cpu"
     capabilities = ["text-embedding"]
 
-    def embed(self, texts: list[str]) -> np.ndarray:  # pragma: no cover - not called
+    def embed(self, texts: list[str], cancel_event: threading.Event | None = None) -> np.ndarray:  # pragma: no cover - not called
         raise RuntimeError("should not run")
 
     def count_tokens(self, texts: list[str]) -> int:  # pragma: no cover - not called

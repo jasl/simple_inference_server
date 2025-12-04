@@ -28,7 +28,11 @@ from app.batching import (
     EmbeddingBatchQueueFullError,
     EmbeddingBatchQueueTimeoutError,
 )
-from app.chat_batching import ChatBatchQueueFullError, ChatBatchQueueTimeoutError
+from app.chat_batching import (
+    ChatBatchQueueFullError,
+    ChatBatchQueueTimeoutError,
+    get_count_executor,
+)
 from app.concurrency.audio_limiter import (
     QUEUE_TIMEOUT_SEC as AUDIO_QUEUE_TIMEOUT_SEC,
     AudioQueueFullError,
@@ -195,7 +199,6 @@ def _normalize_stop(stop: str | list[str] | None) -> list[str] | None:
 async def _prepare_chat_request(
     model: Any,
     messages: list[dict[str, Any]],
-    executor: Any,
 ) -> tuple[dict[str, Any] | None, int]:
     """Tokenize once for both counting and generation when supported by the model.
 
@@ -204,11 +207,14 @@ async def _prepare_chat_request(
 
     loop = asyncio.get_running_loop()
     prepare_timeout = float(os.getenv("CHAT_PREPARE_TIMEOUT_SEC", "10"))
+    count_executor = get_count_executor(
+        use_chat_executor=os.getenv("CHAT_COUNT_USE_CHAT_EXECUTOR", "0") != "0"
+    )
     if hasattr(model, "prepare_inputs"):
         try:
             prepared, prompt_tokens = await asyncio.wait_for(
                 loop.run_in_executor(
-                    executor,
+                    count_executor,
                     lambda: model.prepare_inputs(messages, add_generation_prompt=True),
                 ),
                 timeout=prepare_timeout,
@@ -221,7 +227,7 @@ async def _prepare_chat_request(
             )
 
     prompt_tokens = await asyncio.wait_for(
-        loop.run_in_executor(executor, lambda: model.count_tokens(messages)),
+        loop.run_in_executor(count_executor, lambda: model.count_tokens(messages)),
         timeout=prepare_timeout,
     )
     return None, int(prompt_tokens)
@@ -414,10 +420,15 @@ async def create_embeddings(  # noqa: PLR0912, PLR0915
                 disconnect_task = asyncio.create_task(_cancel_on_disconnect(request, cancel_event))
 
                 if batcher is not None and getattr(batcher, "enabled", False):
-                    work_task: asyncio.Future[Any] = asyncio.ensure_future(batcher.enqueue(req.model, texts))
+                    work_task = asyncio.ensure_future(batcher.enqueue(req.model, texts, cancel_event=cancel_event))
                 else:
                     executor = get_embedding_executor()
-                    work_task = asyncio.ensure_future(loop.run_in_executor(executor, model.embed, texts))
+                    work_task = asyncio.ensure_future(
+                        loop.run_in_executor(
+                            executor,
+                            lambda: model.embed(texts, cancel_event=cancel_event),
+                        )
+                    )
 
                 if disconnect_task is None:
                     disconnect_task = asyncio.create_task(_cancel_on_disconnect(request, cancel_event))
@@ -427,7 +438,14 @@ async def create_embeddings(  # noqa: PLR0912, PLR0915
                     timeout=embed_timeout,
                 )
                 if work_task in done:
-                    vectors = work_task.result()
+                    try:
+                        vectors = work_task.result()
+                    except (asyncio.CancelledError, RuntimeError) as exc:
+                        record_request(req.model, "499")
+                        raise HTTPException(
+                            status_code=status.HTTP_499_CLIENT_CLOSED_REQUEST,
+                            detail="Request cancelled",
+                        ) from exc
                 else:
                     work_task.cancel()
                     raise HTTPException(
@@ -435,6 +453,7 @@ async def create_embeddings(  # noqa: PLR0912, PLR0915
                         detail="Client disconnected",
                     )
             except TimeoutError as exc:
+                cancel_event.set()
                 record_request(req.model, "504")
                 raise HTTPException(
                     status_code=status.HTTP_504_GATEWAY_TIMEOUT,
@@ -577,7 +596,7 @@ async def create_chat_completions(  # noqa: PLR0915, PLR0912
             loop = asyncio.get_running_loop()
             executor = get_chat_executor()
             max_prompt_tokens = int(os.getenv("CHAT_MAX_PROMPT_TOKENS", "4096"))
-            prepared_inputs, prompt_tokens = await _prepare_chat_request(model, raw_messages, executor)
+            prepared_inputs, prompt_tokens = await _prepare_chat_request(model, raw_messages)
             if prompt_tokens > max_prompt_tokens:
                 record_chat_request(req.model, "400")
                 raise HTTPException(
@@ -809,12 +828,12 @@ async def _handle_audio_request(  # noqa: PLR0912, PLR0913, PLR0915
     label_token = set_audio_queue_label(model_name or "audio")
 
     try:
-        temp_path, size_bytes = await _save_upload(file)
-        loop = asyncio.get_running_loop()
-        executor = get_audio_executor()
-        duration = await loop.run_in_executor(executor, lambda: _probe_duration(temp_path))
-
         async with audio_limiter():
+            temp_path, size_bytes = await _save_upload(file)
+            loop = asyncio.get_running_loop()
+            executor = get_audio_executor()
+            duration = await loop.run_in_executor(executor, lambda: _probe_duration(temp_path))
+
             try:
                 model = registry.get(model_name)
             except KeyError as exc:
@@ -840,6 +859,7 @@ async def _handle_audio_request(  # noqa: PLR0912, PLR0913, PLR0915
                             temperature=effective_temperature,
                             task=task,
                             timestamp_granularity=granularity if need_segments else None,
+                            cancel_event=cancel_event,
                         ),
                     )
                 )
@@ -851,7 +871,14 @@ async def _handle_audio_request(  # noqa: PLR0912, PLR0913, PLR0915
                     timeout=audio_timeout,
                 )
                 if work_task in done:
-                    result = work_task.result()
+                    try:
+                        result = work_task.result()
+                    except (asyncio.CancelledError, RuntimeError) as exc:
+                        record_audio_request(model_name, "499")
+                        raise HTTPException(
+                            status_code=status.HTTP_499_CLIENT_CLOSED_REQUEST,
+                            detail="Request cancelled",
+                        ) from exc
                 else:
                     work_task.cancel()
                     raise HTTPException(
@@ -859,6 +886,7 @@ async def _handle_audio_request(  # noqa: PLR0912, PLR0913, PLR0915
                         detail="Client disconnected",
                     )
             except TimeoutError as exc:
+                cancel_event.set()
                 record_audio_request(model_name, "504")
                 raise HTTPException(
                     status_code=status.HTTP_504_GATEWAY_TIMEOUT,

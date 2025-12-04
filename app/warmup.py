@@ -4,24 +4,27 @@ import base64
 import io
 import logging
 import os
+import tempfile
 import time
+import wave
 from collections.abc import Callable, Iterable, Sequence
 from concurrent.futures import ThreadPoolExecutor, wait
 from contextlib import AbstractContextManager, nullcontext
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any, Protocol, TypeGuard, cast, runtime_checkable
 
 import torch
 from PIL import Image
 
 from app.concurrency.limiter import MAX_CONCURRENT
-from app.models.base import EmbeddingModel
+from app.models.base import EmbeddingModel, SpeechModel
 from app.models.registry import ModelRegistry
 from app.monitoring.metrics import record_warmup_pool_ready
 from app.threadpool import (
+    get_audio_executor,
     get_chat_executor,
     get_embedding_executor,
-    get_rerank_executor,
     get_vision_executor,
 )
 
@@ -73,15 +76,6 @@ class Generates(Protocol):
 
 
 @runtime_checkable
-class RerankModel(Protocol):
-    name: str
-    device: DeviceLike
-    capabilities: list[str]
-
-    def rerank(self, *, query: str, documents: list[str]) -> Any:
-        ...
-
-
 @runtime_checkable
 class Embeds(Protocol):
     name: str
@@ -94,6 +88,17 @@ class Embeds(Protocol):
 
 def _should_sync(device: DeviceLike) -> bool:
     return torch.cuda.is_available() and isinstance(device, torch.device) and device.type == "cuda"
+
+
+def _make_silence_wav(duration_sec: float = 0.2, sample_rate: int = 16000) -> str:
+    frames = max(1, int(sample_rate * duration_sec))
+    with tempfile.NamedTemporaryFile(delete=False, suffix=".wav") as tmp:
+        with wave.open(tmp, "w") as wf:
+            wf.setnchannels(1)
+            wf.setsampwidth(2)  # 16-bit PCM
+            wf.setframerate(sample_rate)
+            wf.writeframes(b"\x00\x00" * frames)
+        return tmp.name
 
 
 def warm_up_models(registry: ModelRegistry) -> list[str]:
@@ -117,7 +122,7 @@ def warm_up_models(registry: ModelRegistry) -> list[str]:
         "text-embedding": get_embedding_executor(),
         "chat-completion": get_chat_executor(),
         "vision": get_vision_executor(),
-        "rerank": get_rerank_executor(),
+        "audio": get_audio_executor(),
     }
 
     _failed_models.clear()
@@ -322,6 +327,11 @@ def _inference_context(enabled: bool) -> AbstractContextManager[None]:
 def _executor_for_capability(capability: str, config: WarmupConfig) -> ThreadPoolExecutor:
     executor = config.executors.get(capability)
     if executor is None:
+        if capability.startswith("audio"):
+            fallback = config.executors.get("audio")
+            if fallback is not None:
+                config.executors[capability] = fallback
+                return fallback
         fallback = config.executors.get("text-embedding") or get_embedding_executor()
         config.executors[capability] = fallback
         return fallback
@@ -534,6 +544,51 @@ def _warmup_chat_model(model: object, device: DeviceLike, config: WarmupConfig) 
     )
 
 
+def _warmup_audio_model(model: object, device: DeviceLike, config: WarmupConfig) -> bool:
+    if not isinstance(model, SpeechModel):
+        _record_pool_readiness(
+            model_name=getattr(model, "name", "unknown"),
+            capability="audio-transcription",
+            executor=_executor_for_capability("audio", config),
+            workers=0,
+            ready=False,
+        )
+        logger.warning(
+            "warmup_no_audio", extra={"model": getattr(model, "name", "unknown")}
+        )
+        return False
+
+    sample_path = _make_silence_wav()
+    executor = _executor_for_capability("audio", config)
+
+    def _run_once() -> None:
+        model.transcribe(
+            sample_path,
+            language="en",
+            prompt=None,
+            temperature=0.0,
+            task="transcribe",
+            timestamp_granularity=None,
+            cancel_event=None,
+        )
+
+    context = WarmupContext(
+        model_name=getattr(model, "name", "unknown"),
+        capability="audio-transcription",
+        device=device,
+        config=config,
+        executor=executor,
+    )
+
+    try:
+        return _warmup_with_executor(
+            context=context,
+            run_once=_run_once,
+        )
+    finally:
+        Path(sample_path).unlink(missing_ok=True)
+
+
 def _warmup_vision_model(model: object, device: DeviceLike, config: WarmupConfig) -> bool:
     if not isinstance(model, Generates):
         _record_pool_readiness(
@@ -588,52 +643,6 @@ def _warmup_vision_model(model: object, device: DeviceLike, config: WarmupConfig
     )
 
 
-def _warmup_rerank_model(model: object, device: DeviceLike, config: WarmupConfig) -> bool:
-    # Placeholder implementation for rerank-capable models.
-    try:
-        if not isinstance(model, RerankModel):
-            _record_pool_readiness(
-                model_name=getattr(model, "name", "unknown"),
-                capability="rerank",
-                executor=_executor_for_capability("rerank", config),
-                workers=0,
-                ready=False,
-            )
-            logger.warning("warmup_no_rerank", extra={"model": getattr(model, "name", "unknown")})
-            return False
-        executor = _executor_for_capability("rerank", config)
-
-        def _rerank_once() -> None:
-            with _inference_context(enabled=config.use_inference_mode):
-                model.rerank(query="warmup query", documents=["doc one", "doc two"])
-
-        context = WarmupContext(
-            model_name=getattr(model, "name", "unknown"),
-            capability="rerank",
-            device=device,
-            config=config,
-            executor=executor,
-        )
-
-        return _warmup_with_executor(
-            context=context,
-            run_once=_rerank_once,
-        )
-    except Exception:  # pragma: no cover - startup guardrail
-        logger.exception(
-            "warmup_failed",
-            extra={"model": getattr(model, "name", "unknown"), "capability": "rerank"},
-        )
-        _record_pool_readiness(
-            model_name=getattr(model, "name", "unknown"),
-            capability="rerank",
-            executor=_executor_for_capability("rerank", config),
-            workers=0,
-            ready=False,
-        )
-        return False
-
-
 def _parse_list_env(var: str) -> set[str] | None:
     raw = os.getenv(var)
     if raw is None:
@@ -649,7 +658,8 @@ _CAPABILITY_WARMERS: dict[str, WarmupFn] = {
     "text-embedding": _warmup_embedding_model,
     "chat-completion": _warmup_chat_model,
     "vision": _warmup_vision_model,
-    "rerank": _warmup_rerank_model,
+    "audio-transcription": _warmup_audio_model,
+    "audio-translation": _warmup_audio_model,
 }
 
 

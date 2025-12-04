@@ -21,7 +21,7 @@ class DummyModel:
     name = "dummy"
     dim = 3
 
-    def embed(self, texts: list[str]) -> np.ndarray:
+    def embed(self, texts: list[str], cancel_event: object | None = None) -> np.ndarray:
         arr = np.array([[1.0, 2.0, 3.0]])
         return np.repeat(arr, len(texts), axis=0)
 

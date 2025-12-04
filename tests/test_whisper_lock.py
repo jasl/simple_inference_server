@@ -57,6 +57,7 @@ class DummyWhisper(WhisperASR):
         temperature: float | None,
         task: Literal["transcribe", "translate"],
         timestamp_granularity: Literal["word", "segment"] | None,
+        cancel_event: threading.Event | None = None,
     ) -> SpeechResult:
         return super().transcribe(
             audio_path,
@@ -65,6 +66,7 @@ class DummyWhisper(WhisperASR):
             temperature=temperature,
             task=task,
             timestamp_granularity=timestamp_granularity,
+            cancel_event=cancel_event,
         )
 
 

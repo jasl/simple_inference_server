@@ -48,8 +48,15 @@ class EmbeddingGemmaEmbedding(EmbeddingModel):
         embeddings = torch.nn.functional.normalize(embeddings, p=2, dim=1)
         return embeddings.cpu().numpy()
 
-    def embed(self, texts: list[str]) -> np.ndarray:
-        return embed_with_cache(texts, self._encode, self._cache, self.name)
+    def embed(self, texts: list[str], cancel_event: threading.Event | None = None) -> np.ndarray:
+        if cancel_event is not None and cancel_event.is_set():
+            raise RuntimeError("Embedding cancelled")
+
+        vectors = embed_with_cache(texts, self._encode, self._cache, self.name)
+
+        if cancel_event is not None and cancel_event.is_set():
+            raise RuntimeError("Embedding cancelled")
+        return vectors
 
     def count_tokens(self, texts: list[str]) -> int:
         tokenized = self._get_tokenizer()(texts, add_special_tokens=True)

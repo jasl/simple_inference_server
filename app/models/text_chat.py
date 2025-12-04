@@ -108,7 +108,7 @@ class TextChatModel(ChatModel):
         ) -> ChatGeneration:
         stop_criteria, stop_flag = self._build_stop_criteria(stop, cancel_event)
         prepared_inputs, prompt_len = self.prepare_inputs(messages, add_generation_prompt=True)
-        inputs = self._move_to_device(prepared_inputs)
+        inputs = self._move_to_device({k: v for k, v in prepared_inputs.items() if k != "_prompt_len"})
 
         gen_kwargs: dict[str, Any] = {
             "max_new_tokens": max_new_tokens,
@@ -316,13 +316,18 @@ class TextChatModel(ChatModel):
         """Handle tokenizer outputs that may be dict, BatchEncoding, or tuple/list."""
 
         if isinstance(raw_inputs, dict):
-            return raw_inputs
+            return self._ensure_2d(raw_inputs)
         # BatchEncoding behaves like dict for .items()
         if hasattr(raw_inputs, "data") and isinstance(getattr(raw_inputs, "data"), dict):
-            return cast(dict[str, torch.Tensor], raw_inputs.data)
+            return self._ensure_2d(cast(dict[str, torch.Tensor], raw_inputs.data))
         if hasattr(raw_inputs, "input_ids"):
             # Some tokenizers may return namespace-like objects
-            return {"input_ids": raw_inputs.input_ids, "attention_mask": getattr(raw_inputs, "attention_mask", None)}
+            return self._ensure_2d(
+                {
+                    "input_ids": raw_inputs.input_ids,
+                    "attention_mask": getattr(raw_inputs, "attention_mask", None),
+                }
+            )
         raise ValueError("Tokenizer returned unexpected format for chat template")
 
     def _move_to_device(self, inputs: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
@@ -347,6 +352,23 @@ class TextChatModel(ChatModel):
     def _can_pin_memory(self) -> bool:
         device = getattr(self.model, "device", None)
         return bool(torch.cuda.is_available() and device is not None and str(device).startswith("cuda"))
+
+    @staticmethod
+    def _ensure_2d(inputs: dict[str, torch.Tensor | None]) -> dict[str, torch.Tensor]:
+        """Guarantee input_ids/attention_mask are 2D as expected by generate()."""
+
+        fixed: dict[str, torch.Tensor] = {}
+        for key, tensor in inputs.items():
+            if tensor is None:
+                continue
+            if not torch.is_tensor(tensor):
+                raise ValueError(f"{key} is not a tensor")
+            if tensor.dim() == 1:
+                tensor = tensor.unsqueeze(0)
+            elif tensor.dim() > 2:
+                tensor = tensor.view(tensor.shape[0], -1)
+            fixed[key] = tensor
+        return fixed
 
     def count_tokens(self, messages: Sequence[dict[str, Any]]) -> int:
         encoded = self.tokenizer.apply_chat_template(

@@ -25,6 +25,7 @@ OpenAI-compatible inference API for small/edge models. Ships ready-to-run with F
   - Chat via vLLM/TGI/llama.cpp backends while keeping the same `ChatModel` interface.
   - Embeddings via ONNX/TensorRT (e.g., bge, gemma) to cut CPU/GPU latency.
 - Chat continuous batching phase 2: streaming + user abort (phase 1 is in place; ideas recorded in `docs/continuous_batching.md`).
+- Deepen cancellation support: propagate cancel signals into backend kernels (e.g., vLLM/TGI/llama.cpp/faster-whisper) once their APIs expose cooperative interrupts.
 - Add optional remote inference handler (HTTP/gRPC) implementing the same protocols for easy swapping.
 - Expand benchmarks to compare reference HF vs. high-performance variants under identical prompts/audio.
 - Keep default handlers dependency-light, but add TODO hooks for swapping in faster-whisper/CT2 and ONNX/TensorRT embeddings as optional backends.
@@ -124,10 +125,11 @@ OpenAI-compatible inference API for small/edge models. Ships ready-to-run with F
 - Audio path isolation: `AUDIO_MAX_CONCURRENT` / `AUDIO_MAX_QUEUE_SIZE` / `AUDIO_QUEUE_TIMEOUT_SEC` plus `AUDIO_MAX_WORKERS` size a dedicated limiter + thread pool for Whisper so it will not block chat/embedding traffic; default worker count is **1** and Whisper currently serializes work with a lock, so bumping workers only helps if you fork per-worker pipelines.
   - Handlers must be thread-safe if `AUDIO_MAX_WORKERS` > 1; otherwise wrap shared state with locks (Whisper handler already guards its pipeline but still serializes by default).
 - Request timeouts: `EMBEDDING_GENERATE_TIMEOUT_SEC` (default `60`) and `AUDIO_PROCESS_TIMEOUT_SEC` (default `180`) bound executor work to keep queues from clogging under hung models.
+- Cancellation is best-effort: disconnects/timeouts raise cancel signals but already-running model kernels are not preemptive; rely on timeouts, queue bounds, and low `MAX_CONCURRENT` for protection.
 - Chat batching (text-only): `ENABLE_CHAT_BATCHING` (default `1`), `CHAT_BATCH_WINDOW_MS` (default `10` ms), `CHAT_BATCH_MAX_SIZE` (default `8`), `CHAT_BATCH_QUEUE_SIZE` (default `64`), `CHAT_MAX_PROMPT_TOKENS` (default `4096`), `CHAT_MAX_NEW_TOKENS` (default `2048`), `CHAT_BATCH_ALLOW_VISION` (default `0` keeps vision models on legacy path).
 - Chat scheduler tuning: `CHAT_COUNT_MAX_WORKERS` (token-count threads, default `2`), `CHAT_REQUEUE_RETRIES` (default `3`) and `CHAT_REQUEUE_BASE_DELAY_MS` (default `5`) control requeue backoff to降低峰值 429。
 - Chat cancellation: client disconnects or server-side timeouts raise a cancel signal to the model (stopping criteria). This is **best-effort**—already-running kernels keep executing; use a process-isolated backend if you need hard preemption.
-- Vision fetch safety (Qwen3-VL): `ALLOW_REMOTE_IMAGES=0` (default), `REMOTE_IMAGE_TIMEOUT=5`, `MAX_REMOTE_IMAGE_BYTES=5242880`. Remote HTTP fetch stays **disabled by default** to avoid SSRF/large downloads; enable only with trusted sources **and** set `REMOTE_IMAGE_HOST_ALLOWLIST` (comma-separated domains) or the request will be rejected.
+- Vision fetch safety (Qwen3-VL): `ALLOW_REMOTE_IMAGES=0` (default), `REMOTE_IMAGE_TIMEOUT=5`, `MAX_REMOTE_IMAGE_BYTES=5242880`. Remote HTTP fetch stays **disabled by default** to avoid SSRF/large downloads; enable only with trusted sources **and** set `REMOTE_IMAGE_HOST_ALLOWLIST` (comma-separated domains) or the request will be rejected. Private/loopback IPs are blocked even if allowlisted.
   - TODO: add bandwidth/throughput metrics for remote image fetch when enabled.
 - FP8 models need `accelerate`; non-FP8 variants avoid this dependency.
 
@@ -212,7 +214,7 @@ MODELS=BAAI/bge-m3 uv run python scripts/run_dev.py --device auto
 
 Default model cache is locked to the repo-local `models/` directory. Pre-download models via `scripts/download_models.py` (always writes to `models/`) before building or running the service. For private/licensed models, set `HF_TOKEN` only when running the download script; the runtime uses local files only.
 
-Environment variables can be kept in a `.env` file (see `.env.example`) and are loaded on startup without overriding existing variables. Startup performs an optional warmup for each model (toggle via `ENABLE_WARMUP`, default on): it runs a batch through every executor worker across all capabilities (embeddings, chat, vision, rerank) to initialize per-thread tokenizers and compile kernels.
+Environment variables can be kept in a `.env` file (see `.env.example`) and are loaded on startup without overriding existing variables. Startup performs an optional warmup for each model (toggle via `ENABLE_WARMUP`, default on): it runs a batch through every executor worker across supported capabilities (embeddings, chat, vision, audio) to initialize per-thread tokenizers/pipelines and compile kernels.
 
 Warmup controls:
 - `WARMUP_BATCH_SIZE` / `WARMUP_STEPS`: adjust batch and repetitions.
@@ -230,6 +232,7 @@ Embedding cache: repeated inputs are served from an in-memory LRU keyed by the f
 - **Concurrency gate**: `MAX_CONCURRENT` caps in-flight forwards and also sets threadpool size. On a single GPU/MPS start with 1–2; raise only if throughput improves while p99 stays acceptable.
 - **Micro-batching**: keep `ENABLE_BATCHING=1`; tune `BATCH_WINDOW_MS` (e.g., 4–10 ms; default `6` ms) and `BATCH_WINDOW_MAX_SIZE` (8–16) to trade a few ms of queueing for higher throughput. Set `BATCH_WINDOW_MS=0` to disable coalescing.
 - **Chat batching (text-only)**: `ENABLE_CHAT_BATCHING=1` by default; tune `CHAT_BATCH_WINDOW_MS` (e.g., 4–10 ms) and `CHAT_BATCH_MAX_SIZE` (4–8). Guards: `CHAT_MAX_PROMPT_TOKENS` (default 4096) and `CHAT_MAX_NEW_TOKENS` (default 2048). Vision models stay on the legacy path unless `CHAT_BATCH_ALLOW_VISION=1`.
+- **Chat token counting**: defaults to a dedicated pool (`CHAT_COUNT_USE_CHAT_EXECUTOR=0`). Flip to `1` only if you want counting to share chat worker threads and can tolerate possible head-of-line blocking.
 - **Queueing**: `MAX_QUEUE_SIZE` controls how many requests can wait. Too large increases tail latency; too small yields 429s. Set per your SLA.
 - **Warmup**: keep `ENABLE_WARMUP=1`; for heavier models raise `WARMUP_STEPS` / `WARMUP_BATCH_SIZE` (e.g., 2–3 steps, batch 4–8). Restart after changing models or devices.
 - **Device choice**: set `MODEL_DEVICE` (`cuda`, `cuda:<idx>`, `mps`, `cpu`). On macOS MPS, performance varies with temperature/power; on CUDA you can try `MAX_CONCURRENT=2–4`.
@@ -329,12 +332,11 @@ Unsupported or unregistered `model` values return `404 Model not found`. Be sure
 - Llama.cpp-style APIs
   - `POST /embedding`: generate embedding of a given text
   - `POST /embeddings`: non-OpenAI-compatible embeddings API
-  - `POST /reranking`: rerank documents according to a given query
 - OpenAI-style streaming chat completions (SSE/chunked responses)
 - Request/trace IDs: include a per-request ID in logs and responses for easier tracing.
-- Remote image hardening: allowlist + MIME validation before enabling `ALLOW_REMOTE_IMAGES=1`.
+- Remote image hardening: add strict SSRF/IP filtering, MIME sniffing, redirect limits; keep disabled unless allowlisted hosts are configured.
+- Rerank: implement lightweight rerank handler/endpoint once a backend is chosen (current codepath removed).
 - Test additions: vision chat path, non-batch chat serialization, prompt-length guard, warmup OOM surfacing.
-- Remote image allowlist defaults: tighten host/MIME allowlists and keep remote fetch disabled unless explicitly trusted.
 
 ## License
 

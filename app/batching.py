@@ -2,7 +2,9 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import functools
 import os
+import threading
 import time
 from typing import Any
 
@@ -22,10 +24,11 @@ class EmbeddingBatchQueueTimeoutError(Exception):
 
 
 class _BatchItem:
-    def __init__(self, texts: list[str], future: asyncio.Future[np.ndarray]) -> None:
+    def __init__(self, texts: list[str], future: asyncio.Future[np.ndarray], cancel_event: threading.Event | None) -> None:
         self.texts = texts
         self.future = future
         self.enqueue_time = asyncio.get_running_loop().time()
+        self.cancel_event = cancel_event
 
 
 class ModelBatcher:
@@ -38,7 +41,7 @@ class ModelBatcher:
         self._task: asyncio.Task[None] | None = None
         self.queue_timeout = max(queue_timeout, 0.0)
 
-    async def enqueue(self, texts: list[str]) -> np.ndarray:
+    async def enqueue(self, texts: list[str], cancel_event: threading.Event | None = None) -> np.ndarray:
         loop = asyncio.get_running_loop()
         if self._task is None:
             # Lazily start worker on first request to bind to the running loop.
@@ -46,14 +49,14 @@ class ModelBatcher:
 
         fut: asyncio.Future[np.ndarray] = loop.create_future()
         try:
-            await asyncio.wait_for(self.queue.put(_BatchItem(texts, fut)), timeout=self.queue_timeout)
+            await asyncio.wait_for(self.queue.put(_BatchItem(texts, fut, cancel_event)), timeout=self.queue_timeout)
         except TimeoutError as exc:
             raise EmbeddingBatchQueueTimeoutError("Embedding batch queue wait exceeded") from exc
         except asyncio.QueueFull as exc:
             raise EmbeddingBatchQueueFullError("Embedding batch queue is full") from exc
         return await fut
 
-    async def _worker(self) -> None:
+    async def _worker(self) -> None:  # noqa: PLR0912
         loop = asyncio.get_running_loop()
         executor = get_embedding_executor()
         while True:
@@ -81,11 +84,22 @@ class ModelBatcher:
             texts: list[str] = []
             sizes: list[int] = []
             for bi in batch_items:
+                # Drop canceled items before running expensive work.
+                if bi.cancel_event is not None and bi.cancel_event.is_set():
+                    if not bi.future.done():
+                        bi.future.set_exception(asyncio.CancelledError())
+                    continue
                 texts.extend(bi.texts)
                 sizes.append(len(bi.texts))
 
+            if not texts:
+                continue
+
             try:
-                vectors = await loop.run_in_executor(executor, self.model.embed, texts)
+                vectors = await loop.run_in_executor(
+                    executor,
+                    functools.partial(self.model.embed, texts, cancel_event=None),
+                )
             except Exception as exc:  # pragma: no cover - defensive
                 for bi in batch_items:
                     if not bi.future.done():
@@ -145,12 +159,12 @@ class BatchingService:
                     self.queue_timeout_sec,
                 )
 
-    async def enqueue(self, model_name: str, texts: list[str]) -> np.ndarray:
+    async def enqueue(self, model_name: str, texts: list[str], cancel_event: threading.Event | None = None) -> np.ndarray:
         if not self.enabled:
             raise RuntimeError("Batching disabled")
         if model_name not in self._batchers:
             raise KeyError(f"Model {model_name} not registered")
-        return await self._batchers[model_name].enqueue(texts)
+        return await self._batchers[model_name].enqueue(texts, cancel_event=cancel_event)
 
     async def stop(self) -> None:
         for batcher in self._batchers.values():

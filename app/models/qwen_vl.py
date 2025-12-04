@@ -7,6 +7,8 @@ import io
 import logging
 import os
 import threading
+import socket
+import ipaddress
 import urllib.parse
 from collections.abc import Sequence
 from pathlib import Path
@@ -406,16 +408,20 @@ class QwenVLChat(ChatModel):
                 raise ValueError("Remote image URLs are disabled (set ALLOW_REMOTE_IMAGES=1 to enable)")
 
             parsed = urllib.parse.urlparse(source)
+            if not parsed.hostname:
+                raise ValueError("Remote image host missing")
             if not host_allowlist:
                 # TODO: tighten remote fetch safety (private ranges, content sniffing) if remote images are enabled.
                 raise ValueError("Remote image host allowlist is empty; set REMOTE_IMAGE_HOST_ALLOWLIST to enable remote fetch")
             if parsed.hostname not in host_allowlist:
                 raise ValueError("Remote image host not allowed")
+            _reject_private_ip(parsed.hostname)
 
             client = _get_http_client(timeout=remote_timeout)
 
             # HEAD for MIME/length validation
             head_resp = client.head(source, follow_redirects=True, timeout=remote_timeout)
+            _ensure_public_url(head_resp.url)
             content_length = int(head_resp.headers.get("content-length", "0") or 0)
             if max_bytes and content_length and content_length > max_bytes:
                 raise ValueError("Remote image too large")
@@ -424,6 +430,7 @@ class QwenVLChat(ChatModel):
                 raise ValueError("Remote image MIME not allowed")
 
             with client.stream("GET", source, follow_redirects=True, timeout=remote_timeout) as resp:
+                _ensure_public_url(resp.url)
                 resp.raise_for_status()
                 buf = io.BytesIO()
                 for chunk in resp.iter_bytes(chunk_size=64 * 1024):
@@ -462,3 +469,33 @@ def _get_http_client(*, timeout: float) -> httpx.Client:
             )
             atexit.register(_HTTP_CLIENT.close)
         return _HTTP_CLIENT
+
+
+def _reject_private_ip(host: str) -> None:
+    try:
+        infos = socket.getaddrinfo(host, None)
+    except Exception as exc:  # pragma: no cover - defensive
+        raise ValueError("Failed to resolve remote image host") from exc
+
+    for info in infos:
+        addr = info[4][0]
+        try:
+            ip_obj = ipaddress.ip_address(addr)
+        except ValueError:
+            continue
+        if (
+            ip_obj.is_private
+            or ip_obj.is_loopback
+            or ip_obj.is_link_local
+            or ip_obj.is_reserved
+            or ip_obj.is_multicast
+            or ip_obj.is_unspecified
+        ):
+            raise ValueError("Remote image host not allowed (private address)")
+
+
+def _ensure_public_url(url: httpx.URL) -> None:
+    host = url.host
+    if host is None:
+        raise ValueError("Remote image host missing")
+    _reject_private_ip(host)

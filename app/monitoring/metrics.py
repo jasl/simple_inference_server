@@ -76,6 +76,12 @@ CHAT_BATCH_QUEUE_REJECTIONS = Counter(
     labelnames=("model",),
 )
 
+CHAT_BATCH_REQUEUES = Counter(
+    "chat_batch_requeues_total",
+    "Number of chat batch items requeued due to config mismatch or backpressure",
+    labelnames=("model",),
+)
+
 CHAT_COUNT_POOL_SIZE = Gauge(
     "chat_count_pool_size",
     "Worker count of the chat token counting executor",
@@ -192,6 +198,11 @@ def record_chat_batch_oom_retry(model: str) -> None:
 def record_chat_batch_queue_rejection(model: str) -> None:
     with suppress(Exception):
         CHAT_BATCH_QUEUE_REJECTIONS.labels(model=model).inc()
+
+
+def record_chat_batch_requeue(model: str) -> None:
+    with suppress(Exception):
+        CHAT_BATCH_REQUEUES.labels(model=model).inc()
 
 
 def record_chat_count_pool_size(workers: int) -> None:

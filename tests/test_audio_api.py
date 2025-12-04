@@ -66,6 +66,7 @@ class DummySpeechModel:
         temperature: float | None,
         task: str,
         timestamp_granularity: str | None,
+        cancel_event: object | None = None,
     ) -> SpeechResult:
         return SpeechResult(
             text="hello audio",

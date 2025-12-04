@@ -20,6 +20,7 @@ from app.monitoring.metrics import (
     record_chat_batch_oom_retry,
     record_chat_batch_queue,
     record_chat_batch_queue_rejection,
+    record_chat_batch_requeue,
     record_chat_count_pool_size,
 )
 from app.threadpool import get_chat_executor
@@ -29,8 +30,8 @@ _COUNT_EXECUTOR_REF: dict[str, ThreadPoolExecutor | None] = {"value": None}
 _REQUEUE_RETRIES = max(0, int(os.getenv("CHAT_REQUEUE_RETRIES", "3")))
 _REQUEUE_BASE_DELAY_SEC = max(0.001, float(os.getenv("CHAT_REQUEUE_BASE_DELAY_MS", "5")) / 1000.0)
 _REQUEUE_MAX_DELAY_SEC = float(os.getenv("CHAT_REQUEUE_MAX_DELAY_MS", "100")) / 1000.0
-_REQUEUE_MAX_WAIT_SEC = float(os.getenv("CHAT_REQUEUE_MAX_WAIT_MS", "500")) / 1000.0
-_QUEUE_MAX_WAIT_SEC = float(os.getenv("CHAT_QUEUE_MAX_WAIT_MS", "1000")) / 1000.0
+_REQUEUE_MAX_WAIT_SEC = float(os.getenv("CHAT_REQUEUE_MAX_WAIT_MS", "2000")) / 1000.0
+_QUEUE_MAX_WAIT_SEC = float(os.getenv("CHAT_QUEUE_MAX_WAIT_MS", "2000")) / 1000.0
 _REQUEUE_MAX_TASKS = int(os.getenv("CHAT_REQUEUE_MAX_TASKS", "64"))
 _PREPARE_TIMEOUT_SEC = float(os.getenv("CHAT_PREPARE_TIMEOUT_SEC", "10"))
 _GENERATE_TIMEOUT_SEC = float(os.getenv("CHAT_GENERATE_TIMEOUT_SEC", "60"))
@@ -101,7 +102,8 @@ class ChatBatcher:
 
         # Enforce prompt length; optionally reuse caller-provided count.
         if prompt_tokens is None:
-            use_shared = os.getenv("CHAT_COUNT_USE_CHAT_EXECUTOR", "1") != "0"
+            # Default to a dedicated counting pool to avoid head-of-line blocking chat generation threads.
+            use_shared = os.getenv("CHAT_COUNT_USE_CHAT_EXECUTOR", "0") != "0"
             count_executor = _get_count_executor(use_chat_executor=use_shared)
             try:
                 prompt_tokens = await asyncio.wait_for(
@@ -325,6 +327,7 @@ class ChatBatcher:
 
         try:
             self.queue.put_nowait(item)
+            record_chat_batch_requeue(self.model_name)
             return
         except asyncio.QueueFull:
             pass
@@ -338,20 +341,29 @@ class ChatBatcher:
 
         async def _retry() -> None:
             delay = _REQUEUE_BASE_DELAY_SEC
-            for _attempt in range(_REQUEUE_RETRIES):
+            loop = asyncio.get_running_loop()
+            deadline = loop.time() + _REQUEUE_MAX_WAIT_SEC if _REQUEUE_MAX_WAIT_SEC > 0 else None
+
+            while True:
                 try:
-                    self.queue.put_nowait(item)
+                    if deadline is None:
+                        await self.queue.put(item)
+                    else:
+                        remaining = deadline - loop.time()
+                        if remaining <= 0:
+                            raise TimeoutError
+                        await asyncio.wait_for(self.queue.put(item), timeout=remaining)
+                    record_chat_batch_requeue(self.model_name)
                     return
-                except asyncio.QueueFull:
-                    await asyncio.sleep(delay)
-                    delay = min(delay * 2, _REQUEUE_MAX_DELAY_SEC)
-            try:
-                self.queue.put_nowait(item)
-            except asyncio.QueueFull:
-                if not item.future.done():
-                    item.future.set_exception(ChatBatchQueueTimeoutError("Chat batch queue full"))
-                record_chat_batch_queue_rejection(self.model_name)
-                return
+                except TimeoutError:
+                    break
+                await asyncio.sleep(delay)
+                delay = min(delay * 2, _REQUEUE_MAX_DELAY_SEC)
+
+            if not item.future.done():
+                item.future.set_exception(ChatBatchQueueTimeoutError("Chat batch queue full"))
+            record_chat_batch_queue_rejection(self.model_name)
+            return
 
         task = asyncio.create_task(_retry())
         self._requeue_tasks.add(task)
@@ -400,6 +412,12 @@ def _get_count_executor(*, use_chat_executor: bool) -> ThreadPoolExecutor:
         return count_executor
     record_chat_count_pool_size(max(1, getattr(cached_executor, "_max_workers", 1)))
     return cached_executor
+
+
+def get_count_executor(*, use_chat_executor: bool = False) -> ThreadPoolExecutor:
+    """Public helper to reuse the chat token counting pool."""
+
+    return _get_count_executor(use_chat_executor=use_chat_executor)
 
 
 class ChatBatchingService:

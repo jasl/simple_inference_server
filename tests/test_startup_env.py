@@ -1,7 +1,8 @@
 
 import os
+import threading
 from pathlib import Path
-from typing import cast
+from typing import Literal, cast
 
 import pytest
 
@@ -106,8 +107,9 @@ def test_validate_ffmpeg_for_audio(monkeypatch: pytest.MonkeyPatch) -> None:
             language: str | None,
             prompt: str | None,
             temperature: float | None,
-            task: str,
-            timestamp_granularity: str | None,
+            task: Literal["transcribe", "translate"],
+            timestamp_granularity: Literal["word", "segment"] | None,
+            cancel_event: threading.Event | None = None,
         ) -> SpeechResult:
             return SpeechResult(text="")
 

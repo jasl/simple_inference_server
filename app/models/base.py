@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import threading
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Any, Literal, Protocol, Sequence
+from typing import TYPE_CHECKING, Any, Literal, Protocol, Sequence, runtime_checkable
 
 import numpy as np
 
@@ -17,7 +17,7 @@ class EmbeddingModel(Protocol):
     # Capabilities advertised by the handler, e.g., ["text-embedding"].
     capabilities: list[str]
 
-    def embed(self, texts: list[str]) -> np.ndarray: ...
+    def embed(self, texts: list[str], cancel_event: threading.Event | None = None) -> np.ndarray: ...
 
     def count_tokens(self, texts: list[str]) -> int: ...
 
@@ -95,6 +95,7 @@ class SpeechResult:
     segments: list[SpeechSegment] | None = None
 
 
+@runtime_checkable
 class SpeechModel(Protocol):
     name: str
     device: str | torch.device
@@ -109,4 +110,5 @@ class SpeechModel(Protocol):
         temperature: float | None,
         task: Literal["transcribe", "translate"],
         timestamp_granularity: Literal["word", "segment", None],
+        cancel_event: threading.Event | None = None,
     ) -> SpeechResult: ...

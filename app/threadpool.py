@@ -7,7 +7,6 @@ from concurrent.futures import ThreadPoolExecutor
 EMBEDDING_MAX_WORKERS = max(1, int(os.getenv("EMBEDDING_MAX_WORKERS", "4")))
 CHAT_MAX_WORKERS = max(1, int(os.getenv("CHAT_MAX_WORKERS", "4")))
 VISION_MAX_WORKERS = max(1, int(os.getenv("VISION_MAX_WORKERS", "2")))
-RERANK_MAX_WORKERS = max(1, int(os.getenv("RERANK_MAX_WORKERS", "2")))
 AUDIO_MAX_WORKERS = max(
     1,
     int(os.getenv("AUDIO_MAX_WORKERS", os.getenv("AUDIO_MAX_CONCURRENT", "1"))),
@@ -17,7 +16,6 @@ _state: dict[str, ThreadPoolExecutor | None] = {
     "embedding_executor": None,
     "chat_executor": None,
     "vision_executor": None,
-    "rerank_executor": None,
     "audio_executor": None,
 }
 
@@ -40,10 +38,6 @@ def get_chat_executor() -> ThreadPoolExecutor:
 
 def get_vision_executor() -> ThreadPoolExecutor:
     return _get_executor("vision_executor", VISION_MAX_WORKERS, "vision-worker")
-
-
-def get_rerank_executor() -> ThreadPoolExecutor:
-    return _get_executor("rerank_executor", RERANK_MAX_WORKERS, "rerank-worker")
 
 
 def get_audio_executor() -> ThreadPoolExecutor:
@@ -71,13 +65,6 @@ def shutdown_vision_executor() -> None:
         executor.shutdown(wait=True)
 
 
-def shutdown_rerank_executor() -> None:
-    executor = _state.get("rerank_executor")
-    _state["rerank_executor"] = None
-    if executor is not None:
-        executor.shutdown(wait=True)
-
-
 def shutdown_audio_executor() -> None:
     executor = _state.get("audio_executor")
     _state["audio_executor"] = None
@@ -89,5 +76,4 @@ def shutdown_executors() -> None:
     shutdown_embedding_executor()
     shutdown_chat_executor()
     shutdown_vision_executor()
-    shutdown_rerank_executor()
     shutdown_audio_executor()

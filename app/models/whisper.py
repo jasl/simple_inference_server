@@ -64,7 +64,11 @@ class WhisperASR(SpeechModel):
         temperature: float | None,
         task: Literal["transcribe", "translate"],
         timestamp_granularity: Literal["word", "segment", None],
+        cancel_event: threading.Event | None = None,
     ) -> SpeechResult:
+        if cancel_event is not None and cancel_event.is_set():
+            raise RuntimeError("Transcription cancelled")
+
         generate_kwargs = self._build_generate_kwargs(language, prompt, temperature, task)
         return_ts: bool | str = False
         if timestamp_granularity == "word":
@@ -73,6 +77,8 @@ class WhisperASR(SpeechModel):
             return_ts = True
 
         with self._lock:
+            if cancel_event is not None and cancel_event.is_set():
+                raise RuntimeError("Transcription cancelled")
             result = self.pipeline(
                 audio_path,
                 return_timestamps=return_ts,
