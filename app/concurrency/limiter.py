@@ -39,6 +39,11 @@ def _update_drain_event_locked(in_flight_count: int | None = None) -> None:
         _drain_event.clear()
 
 
+async def _update_drain_event() -> None:
+    async with _in_flight_lock:
+        _update_drain_event_locked(_in_flight_count)
+
+
 async def _change_in_flight(delta: int) -> None:
     global _in_flight_count
     async with _in_flight_lock:
@@ -55,7 +60,7 @@ async def limiter() -> AsyncIterator[None]:
     try:
         _queue.put_nowait(1)
         queued = True
-        _update_drain_event_locked()
+        await _update_drain_event()
     except asyncio.QueueFull as exc:  # queue already at capacity
         record_queue_rejection()
         raise QueueFullError("Request queue is full") from exc
@@ -73,14 +78,18 @@ async def limiter() -> AsyncIterator[None]:
         try:
             yield
         finally:
-            await _change_in_flight(-1)
+            try:
+                await asyncio.shield(_change_in_flight(-1))
+            except asyncio.CancelledError:
+                # Propagate cancellation after ensuring the counter is updated.
+                raise
     finally:
         if acquired:
             _semaphore.release()
         if queued:
             _queue.get_nowait()
             _queue.task_done()
-            _update_drain_event_locked()
+            await _update_drain_event()
 
 
 def stop_accepting() -> None:
