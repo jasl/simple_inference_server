@@ -8,7 +8,7 @@ from fastapi import FastAPI, status
 from fastapi.testclient import TestClient
 
 if "torch" not in sys.modules:
-    torch_stub = types.SimpleNamespace()
+    torch_stub = types.ModuleType("torch")
 
     class _DummyCuda:
         OutOfMemoryError = type("CudaOOM", (Exception,), {})
@@ -21,23 +21,23 @@ if "torch" not in sys.modules:
         def empty_cache() -> None:
             return None
 
-    torch_stub.cuda = _DummyCuda()
-    torch_stub.OutOfMemoryError = type("TorchOOM", (Exception,), {})
+    torch_stub.cuda = _DummyCuda()  # type: ignore[attr-defined]
+    torch_stub.OutOfMemoryError = type("TorchOOM", (Exception,), {})  # type: ignore[attr-defined]
     sys.modules["torch"] = torch_stub
 
 if "torchaudio" not in sys.modules:
-    torchaudio_stub = types.SimpleNamespace()
+    torchaudio_stub = types.ModuleType("torchaudio")
 
     class _DummyInfo:
         def __init__(self) -> None:
             self.num_frames = 0
             self.sample_rate = 0
 
-    torchaudio_stub.info = lambda _path: _DummyInfo()
+    torchaudio_stub.info = lambda _path: _DummyInfo()  # type: ignore[attr-defined]
     sys.modules["torchaudio"] = torchaudio_stub
 
 from app import api
-from app.chat_batching import ChatBatchQueueFullError, ChatBatcher, ChatBatchingService
+from app.chat_batching import ChatBatcher, ChatBatchingService, ChatBatchQueueFullError
 from app.dependencies import get_model_registry
 from app.models.base import ChatGeneration
 from app.monitoring import metrics

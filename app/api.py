@@ -23,6 +23,7 @@ from fastapi import (
 from fastapi.responses import JSONResponse, PlainTextResponse, Response
 from pydantic import BaseModel, Field
 
+from app.chat_batching import ChatBatchQueueFullError
 from app.concurrency.limiter import (
     QUEUE_TIMEOUT_SEC,
     QueueFullError,
@@ -30,7 +31,6 @@ from app.concurrency.limiter import (
     ShuttingDownError,
     limiter,
 )
-from app.chat_batching import ChatBatchQueueFullError
 from app.dependencies import get_model_registry
 from app.models.base import ChatGeneration
 from app.models.registry import ModelRegistry

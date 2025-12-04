@@ -15,8 +15,8 @@ import torch
 from app.monitoring.metrics import (
     observe_chat_batch_size,
     record_chat_batch_oom_retry,
-    record_chat_batch_queue_rejection,
     record_chat_batch_queue,
+    record_chat_batch_queue_rejection,
 )
 from app.threadpool import get_chat_executor
 
