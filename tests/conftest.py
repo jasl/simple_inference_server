@@ -25,8 +25,21 @@ _torch: Any = sys.modules.get("torch", types.ModuleType("torch"))
 if getattr(_torch, "__spec__", None) is None:
     _torch.__spec__ = importlib.machinery.ModuleSpec("torch", loader=None)
 
-_torch.cuda = getattr(_torch, "cuda", types.SimpleNamespace(is_available=lambda: False))
-_torch.xpu = getattr(_torch, "xpu", None)
+_torch.backends = getattr(
+    _torch,
+    "backends",
+    types.SimpleNamespace(mps=types.SimpleNamespace(is_available=lambda: False)),
+)
+_torch.cuda = getattr(
+    _torch,
+    "cuda",
+    types.SimpleNamespace(is_available=lambda: False, device_count=lambda: 0),
+)
+_torch.xpu = getattr(
+    _torch,
+    "xpu",
+    types.SimpleNamespace(is_available=lambda: False),
+)
 _torch.no_grad = getattr(_torch, "no_grad", contextlib.nullcontext)
 
 sys.modules["torch"] = _torch
@@ -106,10 +119,75 @@ if getattr(_numpy, "__spec__", None) is None:
     _numpy.__spec__ = importlib.machinery.ModuleSpec("numpy", loader=None)
 
 class _NDArray:  # pragma: no cover - stub type only
-    pass
+    def __init__(self, data: Any) -> None:
+        self.data = data
+
+    def tolist(self) -> Any:
+        if isinstance(self.data, list):
+            return [getattr(v, "tolist", lambda: v)() for v in self.data]
+        return self.data
+
+    def __iter__(self):
+        return iter(self.data)
+
+    def __getitem__(self, idx: Any) -> Any:
+        return self.data[idx]
+
+    def __len__(self) -> int:
+        return len(self.data)
+
+    def __eq__(self, other: Any) -> bool:
+        other_data = getattr(other, "data", other)
+        return self.data == other_data
+
+    @property
+    def shape(self) -> tuple[int, ...]:
+        if isinstance(self.data, list):
+            if self.data and isinstance(self.data[0], list):
+                return (len(self.data), len(self.data[0]))
+            return (len(self.data),)
+        return ()
+
 
 _numpy.ndarray = _NDArray
-_numpy.array = getattr(_numpy, "array", lambda *a, **k: a[0] if a else None)
+
+def _unwrap(val: Any) -> Any:
+    return getattr(val, "data", val)
+
+
+def _wrap(val: Any) -> _NDArray:
+    return val if isinstance(val, _NDArray) else _NDArray(val)
+
+
+def _as_array(val: Any) -> _NDArray:
+    return _wrap(_unwrap(val))
+
+
+_numpy.array = getattr(_numpy, "array", _as_array)
+_numpy.empty = getattr(_numpy, "empty", lambda shape, dtype=None: _NDArray([]))
+_numpy.stack = getattr(
+    _numpy, "stack", lambda seq, axis=0: _NDArray([_wrap(_unwrap(s)) for s in seq])
+)
+_numpy.repeat = getattr(
+    _numpy,
+    "repeat",
+    lambda arr, repeats, axis=0: _NDArray([_wrap(v) for v in _unwrap(arr)] * int(repeats)),
+)
+_numpy.zeros = getattr(
+    _numpy,
+    "zeros",
+    lambda shape, dtype=None: _NDArray(
+        [[0 for _ in range(shape[1] if len(shape) > 1 else 0)] for _ in range(shape[0])]
+    ),
+)
+
+class _TestingModule(types.SimpleNamespace):  # pragma: no cover - stub type only
+    @staticmethod
+    def assert_array_equal(a: Any, b: Any) -> None:
+        assert _unwrap(a) == _unwrap(b)
+
+
+_numpy.testing = getattr(_numpy, "testing", _TestingModule())
 
 sys.modules["numpy"] = _numpy
 
