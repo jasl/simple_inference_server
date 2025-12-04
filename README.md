@@ -27,6 +27,7 @@ OpenAI-compatible inference API for small/edge models. Ships ready-to-run with F
 - Chat continuous batching phase 2: streaming + user abort (phase 1 is in place; ideas recorded in `docs/continuous_batching.md`).
 - Add optional remote inference handler (HTTP/gRPC) implementing the same protocols for easy swapping.
 - Expand benchmarks to compare reference HF vs. high-performance variants under identical prompts/audio.
+- Keep default handlers dependency-light, but add TODO hooks for swapping in faster-whisper/CT2 and ONNX/TensorRT embeddings as optional backends.
 
 ## Quick start
 
@@ -99,8 +100,17 @@ OpenAI-compatible inference API for small/edge models. Ships ready-to-run with F
      ```bash
      curl -X POST http://localhost:8000/v1/audio/transcriptions \
        -F "model=openai/whisper-tiny" \
-       -F "file=@/path/to/sample.wav" \
-       -F "response_format=text"
+     -F "file=@/path/to/sample.wav" \
+     -F "response_format=text"
+     ```
+   - Manual smoke (embeddings/chat/audio):
+
+     ```bash
+     uv run python scripts/manual_smoke.py \
+       --base-url http://localhost:8000 \
+       --embed-model BAAI/bge-m3 \
+       --chat-model meta-llama/Llama-3.2-1B-Instruct \
+       --audio-model openai/whisper-tiny
      ```
 
 ## Configuration highlights
@@ -108,9 +118,15 @@ OpenAI-compatible inference API for small/edge models. Ships ready-to-run with F
 - `MODELS` (required): comma-separated model IDs from `configs/model_config.yaml`.
 - `MODEL_DEVICE`: `cpu` | `mps` | `cuda` | `cuda:<idx>` | `auto` (default).
 - `AUTO_DOWNLOAD_MODELS` (default `1`): download selected models on startup; set to `0` to require pre-downloaded weights. Startup exits on download/load failure.
+- `WARMUP_FAIL_FAST` (alias `REQUIRE_WARMUP_SUCCESS`, default `1`): when warmup is enabled, abort startup if any model warmup fails instead of serving partially warmed models.
 - Chat generation defaults: per-model `defaults` (temperature/top_p/max_tokens) in the config; request args override.
-- Chat batching (text-only): `ENABLE_CHAT_BATCHING` (default `1`), `CHAT_BATCH_WINDOW_MS` (default `10` ms), `CHAT_BATCH_MAX_SIZE` (default `8`), `CHAT_MAX_PROMPT_TOKENS` (default `4096`), `CHAT_MAX_NEW_TOKENS` (default `2048`), `CHAT_BATCH_ALLOW_VISION` (default `0` keeps vision models on legacy path).
-- Vision fetch safety (Qwen3-VL): `ALLOW_REMOTE_IMAGES=0` (default), `REMOTE_IMAGE_TIMEOUT=5`, `MAX_REMOTE_IMAGE_BYTES=5242880`.
+- Embedding batching queue: `EMBEDDING_BATCH_QUEUE_SIZE` (default `64`, falls back to `BATCH_QUEUE_SIZE` / `MAX_QUEUE_SIZE`) bounds the per-model micro-batch queue to prevent unbounded RAM growth.
+- Audio path isolation: `AUDIO_MAX_CONCURRENT` / `AUDIO_MAX_QUEUE_SIZE` / `AUDIO_QUEUE_TIMEOUT_SEC` plus `AUDIO_MAX_WORKERS` size a dedicated limiter + thread pool for Whisper so it will not block chat/embedding traffic; default worker count is **1** for thread-safety, override if you build per-worker pipelines.
+  - Handlers must be thread-safe if `AUDIO_MAX_WORKERS` > 1; otherwise wrap shared state with locks (Whisper handler already guards its pipeline).
+- Chat batching (text-only): `ENABLE_CHAT_BATCHING` (default `1`), `CHAT_BATCH_WINDOW_MS` (default `10` ms), `CHAT_BATCH_MAX_SIZE` (default `8`), `CHAT_BATCH_QUEUE_SIZE` (default `64`), `CHAT_MAX_PROMPT_TOKENS` (default `4096`), `CHAT_MAX_NEW_TOKENS` (default `2048`), `CHAT_BATCH_ALLOW_VISION` (default `0` keeps vision models on legacy path).
+- Chat scheduler tuning: `CHAT_COUNT_MAX_WORKERS` (token-count threads, default `2`), `CHAT_REQUEUE_RETRIES` (default `3`) and `CHAT_REQUEUE_BASE_DELAY_MS` (default `5`) control requeue backoff to降低峰值 429。
+- Vision fetch safety (Qwen3-VL): `ALLOW_REMOTE_IMAGES=0` (default), `REMOTE_IMAGE_TIMEOUT=5`, `MAX_REMOTE_IMAGE_BYTES=5242880`. Remote HTTP fetch stays **disabled by default** to avoid SSRF/large downloads; enable only with trusted sources.
+  - TODO: add bandwidth/throughput metrics for remote image fetch when enabled.
 - FP8 models need `accelerate`; non-FP8 variants avoid this dependency.
 
 ## Features
@@ -120,6 +136,7 @@ OpenAI-compatible inference API for small/edge models. Ships ready-to-run with F
 - Prometheus metrics, health checks, model listing
 - Micro-batching for embeddings, bounded concurrency and request guards
 - Offline-first: loads only local weights; HF cache under `./models` by default
+- Queue wait histograms for embeddings/chat/audio plus batch wait metrics to tune backpressure.
 
 ## Built-in models (catalog)
 
@@ -175,7 +192,9 @@ Per-model generation defaults (temperature / top_p / max_tokens) can be set in `
 - `POST /v1/audio/translations`: same as transcriptions but forces English output; accepts `prompt`, `temperature`, `response_format`, and `timestamp_granularities`.
 - `GET /v1/models`: List loaded models with id, owner, and embedding dimensions.
 - `GET /health`: Liveness/readiness check; returns 503 if the registry is not ready.
+  - Includes warmup status per model and capability so operators can spot partial warmups.
 - `GET /metrics`: Prometheus metrics (enabled by default; toggle via `ENABLE_METRICS`).
+  - Key histograms: `embedding_request_latency_seconds`, `embedding_request_queue_wait_seconds{model}`, `embedding_batch_wait_seconds{model}`, `chat_request_queue_wait_seconds{model}`, `chat_batch_wait_seconds{model}`, `audio_request_queue_wait_seconds{model}`.
 
 ## Quick start (dev)
 
@@ -200,14 +219,14 @@ Warmup controls:
 - `WARMUP_ALLOWLIST` / `WARMUP_SKIPLIST`: include or skip specific models.
 - `REQUIRE_WARMUP_SUCCESS` (default `0`): fail startup if any model warmup fails.
 
-Request batching: by default the server can micro-batch concurrent embedding requests. Configure via `ENABLE_BATCHING` (default on), `BATCH_WINDOW_MS` (collection window), and `BATCH_WINDOW_MAX_SIZE` (max combined batch). Set `BATCH_WINDOW_MS=0` to effectively disable coalescing.
+Request batching: by default the server can micro-batch concurrent embedding requests. Configure via `ENABLE_BATCHING` (default on), `BATCH_WINDOW_MS` (collection window, default `6` ms), and `BATCH_WINDOW_MAX_SIZE` (max combined batch). Set `BATCH_WINDOW_MS=0` to effectively disable coalescing.
 
 Embedding cache: repeated inputs are served from an in-memory LRU keyed by the full text. Control size with `EMBEDDING_CACHE_SIZE` (default `256` entries per model instance); set to `0` to disable. Prometheus counters `embedding_cache_hits_total` / `embedding_cache_misses_total` expose effectiveness per model.
 
 ## Performance tuning (quick checklist)
 
 - **Concurrency gate**: `MAX_CONCURRENT` caps in-flight forwards and also sets threadpool size. On a single GPU/MPS start with 1–2; raise only if throughput improves while p99 stays acceptable.
-- **Micro-batching**: keep `ENABLE_BATCHING=1`; tune `BATCH_WINDOW_MS` (e.g., 4–10 ms) and `BATCH_WINDOW_MAX_SIZE` (8–16) to trade a few ms of queueing for higher throughput. Set `BATCH_WINDOW_MS=0` to disable coalescing.
+- **Micro-batching**: keep `ENABLE_BATCHING=1`; tune `BATCH_WINDOW_MS` (e.g., 4–10 ms; default `6` ms) and `BATCH_WINDOW_MAX_SIZE` (8–16) to trade a few ms of queueing for higher throughput. Set `BATCH_WINDOW_MS=0` to disable coalescing.
 - **Chat batching (text-only)**: `ENABLE_CHAT_BATCHING=1` by default; tune `CHAT_BATCH_WINDOW_MS` (e.g., 4–10 ms) and `CHAT_BATCH_MAX_SIZE` (4–8). Guards: `CHAT_MAX_PROMPT_TOKENS` (default 4096) and `CHAT_MAX_NEW_TOKENS` (default 2048). Vision models stay on the legacy path unless `CHAT_BATCH_ALLOW_VISION=1`.
 - **Queueing**: `MAX_QUEUE_SIZE` controls how many requests can wait. Too large increases tail latency; too small yields 429s. Set per your SLA.
 - **Warmup**: keep `ENABLE_WARMUP=1`; for heavier models raise `WARMUP_STEPS` / `WARMUP_BATCH_SIZE` (e.g., 2–3 steps, batch 4–8). Restart after changing models or devices.
@@ -311,6 +330,9 @@ Unsupported or unregistered `model` values return `404 Model not found`. Be sure
   - `POST /reranking`: rerank documents according to a given query
 - OpenAI-style streaming chat completions (SSE/chunked responses)
 - Request/trace IDs: include a per-request ID in logs and responses for easier tracing.
+- Remote image hardening: allowlist + MIME validation before enabling `ALLOW_REMOTE_IMAGES=1`.
+- Test additions: vision chat path, non-batch chat serialization, prompt-length guard, warmup OOM surfacing.
+- Remote image allowlist defaults: tighten host/MIME allowlists and keep remote fetch disabled unless explicitly trusted.
 
 ## License
 

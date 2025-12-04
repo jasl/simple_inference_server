@@ -10,12 +10,15 @@ This document captures the current state of the codebase after enabling eager lo
 
 ## Notable risks / improvement areas
 
-- **Warmup failure handling**: Warmup failures only stop startup when `REQUIRE_WARMUP_SUCCESS` is set; otherwise the service can enter ready state with models that never completed a forward pass. Consider enabling the fail-fast flag by default or exposing failing models in `/health` to avoid silent partial readiness.【F:app/main.py†L77-L113】【F:app/state.py†L1-L16】
-- **Prompt-length executor bottleneck**: Chat batching counts tokens on a dedicated thread pool capped at two workers. Large prompts across many concurrent requests can queue here even when downstream capacity is free; making the pool size configurable or reusing the chat executor for counting would reduce this head-of-line risk.【F:app/chat_batching.py†L23-L113】
+*Note: This section is archived; see README/configs for current defaults and constraints.*
+
+## Engineering notes / conventions
+
+- When adding internal tasks that use `limiter` / `audio_limiter`, always set a queue label (model or task name) via `set_queue_label` / `set_audio_queue_label` so queue-wait metrics stay attributable instead of falling back to `generic`.
+- New audio/vision handlers must be thread-safe if they run in a shared thread pool; either design them as thread-safe or protect non-thread-safe resources (tokenizers, pipelines, HTTP clients) with locks similar to `WhisperASR`.
 - **Requeue path on chat batching**: When batching splits by generation parameters, leftover items are requeued without awaiting backoff; if the queue is already near capacity, these requeues immediately fail and surface as exceptions, potentially amplifying spikes. A short retry/backoff loop could smooth burstiness without increasing queue size.【F:app/chat_batching.py†L131-L175】
 - **Visibility of warmup coverage**: Warmup metrics record pool readiness, but the API and health check do not currently surface which capabilities skipped warmup (e.g., models with unrecognized capabilities). Adding per-model warmup status to `/health` or `/v1/models` would make drift obvious.【F:app/warmup.py†L133-L182】
 
 ## Documentation alignment
 
 - README now describes warmup across all capabilities plus configuration toggles for budgets, allow/skip lists, and fail-fast behavior so operators can keep eager-loading guarantees consistent with runtime flags.【F:README.md†L180-L210】
-

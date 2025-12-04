@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import logging
 import os
+import threading
 from pathlib import Path
 from typing import Literal
 
@@ -21,6 +22,8 @@ class WhisperASR(SpeechModel):
         self.name = hf_repo_id  # expose repo id for clarity in logs/metrics
         self.capabilities = ["audio-transcription", "audio-translation"]
         self.device = self._resolve_device(device)
+        self._lock = threading.Lock()
+        self.thread_safe = True
 
         models_dir = Path(__file__).resolve().parent.parent.parent / "models"
         cache_dir = str(models_dir) if models_dir.exists() else os.environ.get("HF_HOME")
@@ -69,11 +72,12 @@ class WhisperASR(SpeechModel):
         elif timestamp_granularity == "segment":
             return_ts = True
 
-        result = self.pipeline(
-            audio_path,
-            return_timestamps=return_ts,
-            generate_kwargs=generate_kwargs,
-        )
+        with self._lock:
+            result = self.pipeline(
+                audio_path,
+                return_timestamps=return_ts,
+                generate_kwargs=generate_kwargs,
+            )
 
         text = (result.get("text") or "").strip()
         language_out = result.get("language") or language

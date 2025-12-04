@@ -31,6 +31,7 @@ type DeviceLike = torch.device | str | int | None
 type CudaDeviceLike = torch.device | str
 
 _failed_models: set[str] = set()
+_capability_status: dict[str, dict[str, bool]] = {}
 
 
 @dataclass
@@ -120,6 +121,7 @@ def warm_up_models(registry: ModelRegistry) -> list[str]:
     }
 
     _failed_models.clear()
+    _capability_status.clear()
     config = WarmupConfig(
         batch_size=batch_size,
         steps=steps,
@@ -171,6 +173,8 @@ def warm_up_models(registry: ModelRegistry) -> list[str]:
             else:
                 logger.warning("warmup_failed", extra=log_extra)
 
+        if capability_results:
+            _capability_status[name] = capability_results
         if capability_results and not all(capability_results.values()):
             _failed_models.add(name)
 
@@ -235,23 +239,19 @@ def _warmup_embedding_model(model: object, device: DeviceLike, config: WarmupCon
                     },
                 )
                 step_complete = True
-            except torch.cuda.OutOfMemoryError as exc:  # pragma: no cover - defensive
-                torch.cuda.empty_cache()
-                current_batch, current_workers, retry = _handle_oom(
-                    model_name=getattr(model, "name", "unknown"),
-                    batch=current_batch,
-                    workers=current_workers,
-                    exc=exc,
+            except torch.cuda.OutOfMemoryError:  # pragma: no cover - defensive
+                logger.exception(
+                    "warmup_oom",
+                    extra={
+                        "model": getattr(model, "name", "unknown"),
+                        "step": step + 1,
+                        "batch_size": current_batch,
+                        "workers": current_workers,
+                        "capability": "text-embedding",
+                        "executor": _executor_label(executor),
+                    },
                 )
-                if not retry:
-                    _record_pool_readiness(
-                        model_name=getattr(model, "name", "unknown"),
-                        capability="text-embedding",
-                        executor=executor,
-                        workers=current_workers,
-                        ready=False,
-                    )
-                    return False
+                raise
             except Exception:  # pragma: no cover - startup guardrail
                 logger.exception(
                     "warmup_failed",
@@ -405,6 +405,17 @@ def _warmup_with_executor(
             if step_extra:
                 log_extra.update(step_extra)
             logger.info("warmup_step_ok", extra=log_extra)
+        except torch.cuda.OutOfMemoryError:  # pragma: no cover - defensive
+            logger.exception(
+                "warmup_oom",
+                extra={
+                    "model": context.model_name,
+                    "capability": context.capability,
+                    "executor": _executor_label(context.executor),
+                    "step": step + 1,
+                },
+            )
+            raise
         except Exception:  # pragma: no cover - startup guardrail
             logger.exception(
                 "warmup_failed",
@@ -642,30 +653,9 @@ _CAPABILITY_WARMERS: dict[str, WarmupFn] = {
 }
 
 
-def _handle_oom(model_name: str, batch: int, workers: int, exc: Exception) -> tuple[int, int, bool]:
-    """Return updated (batch, workers, retry?)."""
-
-    if batch > 1:
-        new_batch = max(1, batch // 2)
-        logger.warning(
-            "warmup_oom_retry",
-            extra={"model": model_name, "batch_size": new_batch, "prev_batch": batch},
-        )
-        return new_batch, 1, True
-
-    if workers > 1:
-        logger.warning(
-            "warmup_oom_retry",
-            extra={"model": model_name, "workers": 1, "prev_workers": workers},
-        )
-        return batch, 1, True
-
-    logger.error(
-        "warmup_oom_give_up",
-        extra={"model": model_name, "error": str(exc)},
-    )
-    return batch, workers, False
-
-
 def get_failed_warmups() -> list[str]:
     return sorted(_failed_models)
+
+
+def get_capability_status() -> dict[str, dict[str, bool]]:
+    return {model: caps.copy() for model, caps in _capability_status.items()}

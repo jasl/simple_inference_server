@@ -4,26 +4,36 @@ import asyncio
 import contextlib
 import functools
 import logging
+import os
 import time
 from collections.abc import Sequence
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from typing import Any
+import functools
+import concurrent.futures
 
 import torch
 
 from app.monitoring.metrics import (
     observe_chat_batch_size,
+    observe_chat_batch_wait,
     record_chat_batch_oom_retry,
     record_chat_batch_queue,
     record_chat_batch_queue_rejection,
+    record_chat_count_pool_size,
 )
 from app.threadpool import get_chat_executor
 
 logger = logging.getLogger(__name__)
-_COUNT_EXECUTOR: ThreadPoolExecutor | None = ThreadPoolExecutor(
-    max_workers=2, thread_name_prefix="chat-count"
-)
+_COUNT_EXECUTOR_REF: dict[str, ThreadPoolExecutor | None] = {"value": None}
+_REQUEUE_RETRIES = max(0, int(os.getenv("CHAT_REQUEUE_RETRIES", "3")))
+_REQUEUE_BASE_DELAY_SEC = max(0.001, float(os.getenv("CHAT_REQUEUE_BASE_DELAY_MS", "5")) / 1000.0)
+_REQUEUE_MAX_DELAY_SEC = float(os.getenv("CHAT_REQUEUE_MAX_DELAY_MS", "100")) / 1000.0
+_REQUEUE_MAX_WAIT_SEC = float(os.getenv("CHAT_REQUEUE_MAX_WAIT_MS", "500")) / 1000.0
+_QUEUE_MAX_WAIT_SEC = float(os.getenv("CHAT_QUEUE_MAX_WAIT_MS", "1000")) / 1000.0
+_PREPARE_TIMEOUT_SEC = float(os.getenv("CHAT_PREPARE_TIMEOUT_SEC", "10"))
+_GENERATE_TIMEOUT_SEC = float(os.getenv("CHAT_GENERATE_TIMEOUT_SEC", "60"))
 
 
 @dataclass
@@ -33,7 +43,11 @@ class _ChatBatchItem:
     temperature: float
     top_p: float
     stop: tuple[str, ...]
+    prompt_tokens: int | None
+    prepared_inputs: dict[str, Any] | None
     future: asyncio.Future[Any]
+    enqueue_time: float
+    deadline: float | None
 
     @property
     def config_key(self) -> tuple[float, float, int, tuple[str, ...]]:
@@ -42,6 +56,10 @@ class _ChatBatchItem:
 
 class ChatBatchQueueFullError(Exception):
     """Raised when the chat batch queue is full."""
+
+
+class ChatBatchQueueTimeoutError(Exception):
+    """Raised when a chat request waits too long in the batch queue."""
 
 
 class ChatBatcher:
@@ -59,8 +77,9 @@ class ChatBatcher:
         self._task: asyncio.Task[None] | None = None
         self._stopping = False
         self.oom_retries = 0
+        self._requeue_tasks: set[asyncio.Task[None]] = set()
 
-    async def enqueue(
+    async def enqueue(  # noqa: PLR0913 - explicit params keep batching contract clear
         self,
         messages: Sequence[dict[str, Any]],
         *,
@@ -68,6 +87,8 @@ class ChatBatcher:
         temperature: float,
         top_p: float,
         stop: Sequence[str] | None,
+        prompt_tokens: int | None = None,
+        prepared_inputs: dict[str, Any] | None = None,
     ) -> Any:
         if self._stopping:
             raise RuntimeError("Chat batcher is stopping")
@@ -76,10 +97,19 @@ class ChatBatcher:
 
         loop = asyncio.get_running_loop()
 
-        # Enforce prompt length; use a lightweight dedicated executor to avoid starving the main pool.
-        if _COUNT_EXECUTOR is None:  # pragma: no cover - defensive guard during shutdown
-            raise RuntimeError("Chat count executor is not available")
-        prompt_tokens = await loop.run_in_executor(_COUNT_EXECUTOR, self.model.count_tokens, messages)
+        # Enforce prompt length; optionally reuse caller-provided count.
+        if prompt_tokens is None:
+            use_shared = os.getenv("CHAT_COUNT_USE_CHAT_EXECUTOR", "1") != "0"
+            count_executor = _get_count_executor(use_chat_executor=use_shared)
+            try:
+                prompt_tokens = await asyncio.wait_for(
+                    loop.run_in_executor(count_executor, self.model.count_tokens, messages),
+                    timeout=_PREPARE_TIMEOUT_SEC,
+                )
+            except asyncio.TimeoutError as exc:  # pragma: no cover - defensive
+                raise ValueError("Prompt processing timed out") from exc
+        assert prompt_tokens is not None
+        prompt_tokens = int(prompt_tokens)
         if prompt_tokens > self.max_prompt_tokens:
             raise ValueError(f"Prompt too long; max {self.max_prompt_tokens} tokens")
 
@@ -93,7 +123,11 @@ class ChatBatcher:
             temperature=temperature,
             top_p=top_p,
             stop=tuple(stop or []),
+            prompt_tokens=prompt_tokens,
+            prepared_inputs=prepared_inputs,
             future=fut,
+            enqueue_time=loop.time(),
+            deadline=loop.time() + _REQUEUE_MAX_WAIT_SEC if _REQUEUE_MAX_WAIT_SEC > 0 else None,
         )
         try:
             self.queue.put_nowait(item)
@@ -135,19 +169,38 @@ class ChatBatcher:
                 batch_items = max(buckets.values(), key=len)
                 leftover: list[_ChatBatchItem] = [it for bucket in buckets.values() for it in bucket if it not in batch_items]
                 for pending in leftover:
-                    try:
-                        self.queue.put_nowait(pending)
-                    except asyncio.QueueFull:
-                        if not pending.future.done():
-                            pending.future.set_exception(asyncio.QueueFull("Chat batch queue full"))
+                    self._schedule_requeue(pending)
 
                 pending_size = self.queue.qsize()
-                record_chat_batch_queue(self.model_name, pending_size + len(leftover))
+                record_chat_batch_queue(self.model_name, pending_size)
                 observe_chat_batch_size(self.model_name, len(batch_items))
+                now = loop.time()
+                for bi in batch_items:
+                    try:
+                        observe_chat_batch_wait(self.model_name, now - bi.enqueue_time)
+                    except Exception:
+                        pass
+
+                # Drop items that waited too long in queue
+                if _QUEUE_MAX_WAIT_SEC > 0:
+                    alive_items: list[_ChatBatchItem] = []
+                    for bi in batch_items:
+                        if now - bi.enqueue_time > _QUEUE_MAX_WAIT_SEC:
+                            if not bi.future.done():
+                                bi.future.set_exception(ChatBatchQueueTimeoutError("Chat batch queue wait exceeded"))
+                            record_chat_batch_queue_rejection(self.model_name)
+                        else:
+                            alive_items.append(bi)
+                    if not alive_items:
+                        continue
+                    batch_items = alive_items
 
                 try:
                     run_batch = functools.partial(self._generate_batch, list(batch_items))
-                    results = await loop.run_in_executor(executor, run_batch)
+                    results = await asyncio.wait_for(
+                        loop.run_in_executor(executor, run_batch),
+                        timeout=_GENERATE_TIMEOUT_SEC,
+                    )
                 except Exception as exc:  # pragma: no cover - defensive
                     logger.exception(
                         "chat_batch_failed",
@@ -159,6 +212,12 @@ class ChatBatcher:
                     for bi in batch_items:
                         if not bi.future.done():
                             bi.future.set_exception(exc)
+                    continue
+                except asyncio.TimeoutError as exc:  # pragma: no cover - defensive
+                    for bi in batch_items:
+                        if not bi.future.done():
+                            bi.future.set_exception(ChatBatchQueueTimeoutError("Chat generation timed out"))
+                    record_chat_batch_queue_rejection(self.model_name)
                     continue
 
                 for bi, gen in zip(batch_items, results, strict=False):
@@ -176,29 +235,43 @@ class ChatBatcher:
     def _generate_batch(self, batch_items: list[_ChatBatchItem]) -> list[Any]:
         """Run batched generation if the model supports it; fall back to per-request."""
 
+        def _run_with_timeout(fn: callable) -> Any:
+            return fn()
+
         stop_list = list(batch_items[0].stop)
         max_new_tokens = batch_items[0].max_new_tokens
         temperature = batch_items[0].temperature
         top_p = batch_items[0].top_p
 
         try:
-            if hasattr(self.model, "batched_generate"):
-                return self.model.batched_generate(
-                    [bi.messages for bi in batch_items],
-                    max_new_tokens=max_new_tokens,
-                    temperature=temperature,
-                    top_p=top_p,
-                    stop=stop_list,
+            prepared_inputs = [bi.prepared_inputs for bi in batch_items]
+            has_prepared = all(pi is not None for pi in prepared_inputs)
+
+            if has_prepared and hasattr(self.model, "batched_generate_prepared"):
+                return _run_with_timeout(
+                    lambda: self.model.batched_generate_prepared(
+                        prepared_inputs,
+                        max_new_tokens=max_new_tokens,
+                        temperature=temperature,
+                        top_p=top_p,
+                        stop=stop_list,
+                    )
                 )
+
+            if hasattr(self.model, "batched_generate"):
+                return _run_with_timeout(
+                    lambda: self.model.batched_generate(
+                        [bi.messages for bi in batch_items],
+                        max_new_tokens=max_new_tokens,
+                        temperature=temperature,
+                        top_p=top_p,
+                        stop=stop_list,
+                    )
+                )
+
             # Fallback: run sequentially (still reduces queue contention)
             return [
-                self.model.generate(
-                    bi.messages,
-                    max_new_tokens=max_new_tokens,
-                    temperature=temperature,
-                    top_p=top_p,
-                    stop=stop_list,
-                )
+                self._generate_single(bi, stop_list, max_new_tokens, temperature, top_p)
                 for bi in batch_items
             ]
         except (torch.cuda.OutOfMemoryError, torch.OutOfMemoryError):  # pragma: no cover - OOM guard
@@ -210,15 +283,79 @@ class ChatBatcher:
                 raise
             # Retry sequentially to reduce peak memory.
             return [
-                self.model.generate(
-                    bi.messages,
+                self._generate_single(bi, stop_list, max_new_tokens, temperature, top_p)
+                for bi in batch_items
+            ]
+
+    def _generate_single(
+        self,
+        item: _ChatBatchItem,
+        stop_list: list[str],
+        max_new_tokens: int,
+        temperature: float,
+        top_p: float,
+    ) -> Any:
+        timeout = float(os.getenv("CHAT_GENERATE_TIMEOUT_SEC", "60"))
+
+        def _run():
+            if item.prepared_inputs is not None and hasattr(self.model, "generate_prepared"):
+                return self.model.generate_prepared(
+                    item.prepared_inputs,
                     max_new_tokens=max_new_tokens,
                     temperature=temperature,
                     top_p=top_p,
                     stop=stop_list,
                 )
-                for bi in batch_items
-            ]
+
+            return self.model.generate(
+                item.messages,
+                max_new_tokens=max_new_tokens,
+                temperature=temperature,
+                top_p=top_p,
+                stop=stop_list,
+            )
+
+        with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
+            return pool.submit(_run).result(timeout=timeout)
+
+    def _schedule_requeue(self, item: _ChatBatchItem) -> None:
+        """Requeue leftovers without blocking the main worker loop."""
+
+        # Drop if deadline passed
+        if item.deadline is not None and asyncio.get_running_loop().time() >= item.deadline:
+            if not item.future.done():
+                item.future.set_exception(asyncio.QueueFull("Chat batch queue deadline exceeded"))
+            record_chat_batch_queue_rejection(self.model_name)
+            return
+
+        try:
+            self.queue.put_nowait(item)
+            return
+        except asyncio.QueueFull:
+            pass
+
+        async def _retry() -> None:
+            delay = _REQUEUE_BASE_DELAY_SEC
+            for _attempt in range(_REQUEUE_RETRIES):
+                try:
+                    self.queue.put_nowait(item)
+                    return
+                except asyncio.QueueFull:
+                    await asyncio.sleep(delay)
+                    delay = min(delay * 2, _REQUEUE_MAX_DELAY_SEC)
+            try:
+                self.queue.put_nowait(item)
+            except asyncio.QueueFull:
+                if not item.future.done():
+                    item.future.set_exception(asyncio.QueueFull("Chat batch queue full"))
+
+        task = asyncio.create_task(_retry())
+        self._requeue_tasks.add(task)
+
+        def _cleanup(_t: asyncio.Task[Any]) -> None:
+            self._requeue_tasks.discard(_t)
+
+        task.add_done_callback(_cleanup)
 
     async def stop(self) -> None:
         self._stopping = True
@@ -231,13 +368,34 @@ class ChatBatcher:
             with contextlib.suppress(asyncio.CancelledError):
                 await self._task
         self._task = None
+        for task in list(self._requeue_tasks):
+            task.cancel()
+        self._requeue_tasks.clear()
 
 
 def shutdown_count_executor() -> None:
-    global _COUNT_EXECUTOR
-    executor, _COUNT_EXECUTOR = _COUNT_EXECUTOR, None
+    executor = _COUNT_EXECUTOR_REF.get("value")
+    _COUNT_EXECUTOR_REF["value"] = None
     if executor is not None:
         executor.shutdown(wait=True)
+
+
+def _get_count_executor(*, use_chat_executor: bool) -> ThreadPoolExecutor:
+    if use_chat_executor:
+        executor = get_chat_executor()
+        workers = max(1, getattr(executor, "_max_workers", 1))
+        record_chat_count_pool_size(workers)
+        return executor
+
+    cached_executor: ThreadPoolExecutor | None = _COUNT_EXECUTOR_REF.get("value")
+    if cached_executor is None:
+        workers = max(1, int(os.getenv("CHAT_COUNT_MAX_WORKERS", "2")))
+        count_executor = ThreadPoolExecutor(max_workers=workers, thread_name_prefix="chat-count")
+        _COUNT_EXECUTOR_REF["value"] = count_executor
+        record_chat_count_pool_size(workers)
+        return count_executor
+    record_chat_count_pool_size(max(1, getattr(cached_executor, "_max_workers", 1)))
+    return cached_executor
 
 
 class ChatBatchingService:
@@ -294,6 +452,8 @@ class ChatBatchingService:
         temperature: float,
         top_p: float,
         stop: Sequence[str] | None,
+        prompt_tokens: int | None = None,
+        prepared_inputs: dict[str, Any] | None = None,
     ) -> Any:
         if not self.enabled:
             raise RuntimeError("Chat batching disabled")
@@ -305,8 +465,16 @@ class ChatBatchingService:
             temperature=temperature,
             top_p=top_p,
             stop=stop,
+            prompt_tokens=prompt_tokens,
+            prepared_inputs=prepared_inputs,
         )
 
     async def stop(self) -> None:
         for batcher in self._batchers.values():
             await batcher.stop()
+
+    def queue_stats(self) -> dict[str, tuple[int, int]]:
+        stats: dict[str, tuple[int, int]] = {}
+        for name, batcher in self._batchers.items():
+            stats[name] = (batcher.queue.qsize(), batcher.queue.maxsize)
+        return stats

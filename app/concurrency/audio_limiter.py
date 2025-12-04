@@ -4,31 +4,34 @@ from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 import contextvars
 
-from app.monitoring.metrics import observe_queue_wait, record_queue_rejection, GENERIC_LABEL_WARN
+from app.monitoring.metrics import observe_audio_queue_wait, record_queue_rejection, AUDIO_GENERIC_LABEL_WARN
 
 
-class QueueFullError(Exception):
-    """Raised when the request queue is full."""
+class AudioQueueFullError(Exception):
+    """Raised when the audio request queue is full."""
 
 
-class QueueTimeoutError(Exception):
-    """Raised when waiting for an available worker times out."""
+class AudioQueueTimeoutError(Exception):
+    """Raised when waiting for an available audio worker times out."""
 
 
-class ShuttingDownError(Exception):
-    """Raised when service is draining and not accepting new work."""
+class AudioShuttingDownError(Exception):
+    """Raised when service is draining and not accepting new audio work."""
 
 
-MAX_CONCURRENT = int(os.getenv("MAX_CONCURRENT", "4"))
-MAX_QUEUE_SIZE = int(os.getenv("MAX_QUEUE_SIZE", "64"))
-QUEUE_TIMEOUT_SEC = float(os.getenv("QUEUE_TIMEOUT_SEC", "2.0"))
+_MAX_CONCURRENT_DEFAULT = os.getenv("MAX_CONCURRENT", "4")
+MAX_CONCURRENT = int(os.getenv("AUDIO_MAX_CONCURRENT", _MAX_CONCURRENT_DEFAULT))
+_MAX_QUEUE_DEFAULT = os.getenv("MAX_QUEUE_SIZE", "64")
+MAX_QUEUE_SIZE = int(os.getenv("AUDIO_MAX_QUEUE_SIZE", _MAX_QUEUE_DEFAULT))
+_TIMEOUT_DEFAULT = os.getenv("QUEUE_TIMEOUT_SEC", "2.0")
+QUEUE_TIMEOUT_SEC = float(os.getenv("AUDIO_QUEUE_TIMEOUT_SEC", _TIMEOUT_DEFAULT))
 
 _semaphore: asyncio.Semaphore = asyncio.Semaphore(MAX_CONCURRENT)
 _queue: asyncio.Queue[int] = asyncio.Queue(MAX_QUEUE_SIZE)
 _state = {"accepting": True}
 _in_flight_state = {"count": 0}
 _in_flight_lock = asyncio.Lock()
-_queue_label: contextvars.ContextVar[str] = contextvars.ContextVar("queue_label", default="generic")
+_queue_label: contextvars.ContextVar[str] = contextvars.ContextVar("audio_queue_label", default="audio")
 
 
 async def _change_in_flight(delta: int) -> None:
@@ -45,17 +48,17 @@ async def _get_in_flight() -> int:
 @asynccontextmanager
 async def limiter() -> AsyncIterator[None]:
     if not _state["accepting"]:
-        raise ShuttingDownError("Service is shutting down")
+        raise AudioShuttingDownError("Service is shutting down")
     queued = False
     label = _queue_label.get()
-    if label == "generic":
-        GENERIC_LABEL_WARN.inc()
+    if label == "audio":
+        AUDIO_GENERIC_LABEL_WARN.inc()
     try:
         _queue.put_nowait(1)
         queued = True
     except asyncio.QueueFull as exc:  # queue already at capacity
         record_queue_rejection()
-        raise QueueFullError("Request queue is full") from exc
+        raise AudioQueueFullError("Audio request queue is full") from exc
 
     acquired = False
     start_wait = asyncio.get_running_loop().time()
@@ -63,10 +66,10 @@ async def limiter() -> AsyncIterator[None]:
         try:
             await asyncio.wait_for(_semaphore.acquire(), timeout=QUEUE_TIMEOUT_SEC)
             acquired = True
-            observe_queue_wait(label, asyncio.get_running_loop().time() - start_wait)
+            observe_audio_queue_wait(label, asyncio.get_running_loop().time() - start_wait)
         except TimeoutError as exc:  # waited too long
             record_queue_rejection()
-            raise QueueTimeoutError("Timed out waiting for worker") from exc
+            raise AudioQueueTimeoutError("Timed out waiting for audio worker") from exc
 
         await _change_in_flight(1)
         try:
@@ -75,7 +78,6 @@ async def limiter() -> AsyncIterator[None]:
             try:
                 await asyncio.shield(_change_in_flight(-1))
             except asyncio.CancelledError:
-                # Propagate cancellation after ensuring the counter is updated.
                 raise
     finally:
         if acquired:
@@ -97,12 +99,12 @@ def reset_queue_label(token: contextvars.Token[str]) -> None:
 
 
 def stop_accepting() -> None:
-    """Block new work from entering the queue."""
+    """Block new audio work from entering the queue."""
     _state["accepting"] = False
 
 
 async def wait_for_drain(timeout: float = 5.0) -> None:
-    """Wait for in-flight work to finish, with a timeout."""
+    """Wait for in-flight audio work to finish, with a timeout."""
     loop = asyncio.get_running_loop()
     deadline = loop.time() + timeout
     while True:

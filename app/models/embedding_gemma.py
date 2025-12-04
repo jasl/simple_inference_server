@@ -18,6 +18,7 @@ class EmbeddingGemmaEmbedding(EmbeddingModel):
         self.device = torch.device(device)
         self.hf_repo_id = hf_repo_id
         self._tokenizer_local = threading.local()
+        self.thread_safe = True
         models_dir = Path(__file__).resolve().parent.parent.parent / "models"
         self.cache_dir = str(models_dir) if models_dir.exists() else os.environ.get("HF_HOME")
         cache_size = int(os.getenv("EMBEDDING_CACHE_SIZE", "256"))

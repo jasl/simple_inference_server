@@ -9,7 +9,7 @@ from pathlib import Path
 import huggingface_hub as hf
 import torch
 import yaml
-from dotenv import load_dotenv
+from app import warmup
 from fastapi import FastAPI
 from huggingface_hub import snapshot_download
 
@@ -17,7 +17,8 @@ from app import state
 from app.api import router as api_router
 from app.batching import BatchingService
 from app.chat_batching import ChatBatchingService, shutdown_count_executor
-from app.concurrency import limiter
+from app.concurrency import audio_limiter as audio_limits, limiter
+from app.concurrency.audio_limiter import stop_accepting as stop_accepting_audio, wait_for_drain as wait_for_drain_audio
 from app.concurrency.limiter import stop_accepting, wait_for_drain
 from app.logging_config import setup_logging
 from app.models.registry import ModelRegistry
@@ -25,11 +26,14 @@ from app.monitoring.metrics import setup_metrics
 from app.state import WarmupStatus
 from app.threadpool import shutdown_executors
 from app.warmup import warm_up_models
+from app.threadpool import (
+    EMBEDDING_MAX_WORKERS,
+    CHAT_MAX_WORKERS,
+    VISION_MAX_WORKERS,
+    AUDIO_MAX_WORKERS,
+)
 
 logger = logging.getLogger(__name__)
-
-# Load environment variables from a .env file if present (does not override existing env).
-load_dotenv(override=False)
 
 
 def startup() -> tuple[ModelRegistry, BatchingService, ChatBatchingService]:
@@ -59,18 +63,21 @@ def startup() -> tuple[ModelRegistry, BatchingService, ChatBatchingService]:
         logger.exception("Failed to load models during startup", extra={"config_path": config_path})
         # Hard exit to avoid serving traffic with missing/bad models
         raise SystemExit(1) from exc
+    _warn_thread_unsafe_models(registry)
     _validate_ffmpeg_for_audio(registry)
 
     batching_enabled = os.getenv("ENABLE_BATCHING", "1") != "0"
-    batch_window_ms = float(os.getenv("BATCH_WINDOW_MS", "0"))
+    batch_window_ms = float(os.getenv("BATCH_WINDOW_MS", "6"))
     batch_max_size = int(
         os.getenv("BATCH_WINDOW_MAX_SIZE", os.getenv("BATCH_MAX_SIZE", os.getenv("MAX_BATCH_SIZE", "32")))
     )
+    batch_queue_size = int(os.getenv("EMBEDDING_BATCH_QUEUE_SIZE", os.getenv("BATCH_QUEUE_SIZE", os.getenv("MAX_QUEUE_SIZE", "64"))))
     batching_service = BatchingService(
         registry,
         enabled=batching_enabled,
         max_batch_size=batch_max_size,
         window_ms=batch_window_ms,
+        queue_size=batch_queue_size,
     )
     chat_batching_enabled = os.getenv("ENABLE_CHAT_BATCHING", "1") != "0"
     chat_batch_window_ms = float(os.getenv("CHAT_BATCH_WINDOW_MS", "10"))
@@ -107,12 +114,16 @@ def startup() -> tuple[ModelRegistry, BatchingService, ChatBatchingService]:
         "enable_batching": batching_enabled,
         "batch_window_ms": batch_window_ms,
         "batch_max_size": batch_max_size,
+        "embedding_batch_queue_size": batch_queue_size,
         "enable_chat_batching": chat_batching_enabled,
         "chat_batch_window_ms": chat_batch_window_ms,
         "chat_batch_max_size": chat_batch_max_size,
         "chat_max_prompt_tokens": chat_max_prompt_tokens,
         "chat_max_new_tokens": chat_max_new_tokens,
         "chat_batch_queue_size": chat_batch_queue_size,
+        "audio_max_concurrent": audio_limits.MAX_CONCURRENT,
+        "audio_max_queue_size": audio_limits.MAX_QUEUE_SIZE,
+        "audio_queue_timeout_sec": audio_limits.QUEUE_TIMEOUT_SEC,
     }
     logger.info(
         "Loaded models",
@@ -125,19 +136,27 @@ def startup() -> tuple[ModelRegistry, BatchingService, ChatBatchingService]:
     logger.info("runtime_config", extra=runtime_cfg)
 
     warmup_required = os.getenv("ENABLE_WARMUP", "1") != "0"
-    require_warmup_success = os.getenv("REQUIRE_WARMUP_SUCCESS", "0") != "0"
+    # Backward compatible: WARMUP_FAIL_FAST overrides REQUIRE_WARMUP_SUCCESS (default on).
+    require_warmup_success = os.getenv(
+        "WARMUP_FAIL_FAST",
+        os.getenv("REQUIRE_WARMUP_SUCCESS", "1"),
+    ) != "0"
     warmup_failures: list[str] = []
     warmup_completed = not warmup_required
     if warmup_required:
         warmup_failures = warm_up_models(registry)
         warmup_completed = True
         if require_warmup_success and warmup_failures:
-            raise SystemExit(
-                "Warmup failures detected and REQUIRE_WARMUP_SUCCESS is enabled."
-            )
+            failed_list = ", ".join(sorted(warmup_failures))
+            raise SystemExit(f"Warmup failed for model(s): {failed_list}")
 
+    ok_models = [] if warmup_failures else registry.list_models()
     warmup_status = WarmupStatus(
-        required=warmup_required, completed=warmup_completed, failures=warmup_failures
+        required=warmup_required,
+        completed=warmup_completed,
+        failures=warmup_failures,
+        ok_models=ok_models,
+        capabilities=warmup.get_capability_status(),
     )
     state.warmup_status = warmup_status
 
@@ -167,14 +186,44 @@ def _warn_if_accelerate_missing(config_path: str, allowlist: list[str] | None) -
 
     if fp8_models:
         if importlib.util.find_spec("accelerate") is None:
-            logger.warning(
-                "FP8 models %s require 'accelerate'. Install it or switch to non-FP8 repos.",
-                fp8_models,
+            raise SystemExit(
+                f"FP8 models {fp8_models} require 'accelerate'. Install it or select non-FP8 repos."
             )
         if not torch.cuda.is_available() and not getattr(torch, "xpu", None):
+            raise SystemExit(
+                f"FP8 models {fp8_models} require a GPU/XPU runtime. Select non-FP8 variants or run on GPU/XPU."
+            )
+
+
+def _warn_thread_unsafe_models(registry: ModelRegistry) -> None:
+    """Warn if non-thread-safe handlers are paired with worker>1 executors."""
+
+    for name in registry.list_models():
+        model = registry.get(name)
+        thread_safe = getattr(model, "thread_safe", True)
+        if thread_safe:
+            continue
+
+        caps = getattr(model, "capabilities", [])
+        warn = False
+        workers = None
+        if "audio-transcription" in caps or "audio-translation" in caps:
+            warn = AUDIO_MAX_WORKERS > 1
+            workers = AUDIO_MAX_WORKERS
+        elif "vision" in caps:
+            warn = VISION_MAX_WORKERS > 1
+            workers = VISION_MAX_WORKERS
+        elif "chat-completion" in caps:
+            warn = CHAT_MAX_WORKERS > 1
+            workers = CHAT_MAX_WORKERS
+        elif "text-embedding" in caps:
+            warn = EMBEDDING_MAX_WORKERS > 1
+            workers = EMBEDDING_MAX_WORKERS
+
+        if warn:
             logger.warning(
-                "FP8 models %s require a GPU/XPU runtime. Select non-FP8 variants or run on GPU.",
-                fp8_models,
+                "thread_unsafe_model_with_multiple_workers",
+                extra={"model": name, "capabilities": caps, "workers": workers},
             )
 
 
@@ -237,7 +286,9 @@ async def shutdown(
     chat_batching_service: ChatBatchingService | None,
 ) -> None:
     stop_accepting()
+    stop_accepting_audio()
     await wait_for_drain()
+    await wait_for_drain_audio()
     state.model_registry = None
     if batching_service is not None:
         await batching_service.stop()

@@ -23,11 +23,23 @@ from fastapi.responses import JSONResponse, PlainTextResponse, Response
 from pydantic import BaseModel, Field
 
 from app.chat_batching import ChatBatchQueueFullError
+from app.chat_batching import ChatBatchQueueTimeoutError
+from app.concurrency.audio_limiter import (
+    QUEUE_TIMEOUT_SEC as AUDIO_QUEUE_TIMEOUT_SEC,
+    AudioQueueFullError,
+    AudioQueueTimeoutError,
+    AudioShuttingDownError,
+    reset_queue_label as reset_audio_queue_label,
+    set_queue_label as set_audio_queue_label,
+    limiter as audio_limiter,
+)
 from app.concurrency.limiter import (
     QUEUE_TIMEOUT_SEC,
     QueueFullError,
     QueueTimeoutError,
     ShuttingDownError,
+    reset_queue_label,
+    set_queue_label,
     limiter,
 )
 from app.dependencies import get_model_registry
@@ -42,13 +54,14 @@ from app.monitoring.metrics import (
     record_request,
 )
 from app.state import WarmupStatus, warmup_status as global_warmup_status
-from app.threadpool import get_chat_executor, get_embedding_executor
+from app.threadpool import get_audio_executor, get_chat_executor, get_embedding_executor
 from app.utils.uploads import chunked_upload_to_tempfile
 
 router = APIRouter()
 logger = logging.getLogger(__name__)
 MAX_AUDIO_BYTES = int(os.getenv("MAX_AUDIO_BYTES", str(25 * 1024 * 1024)))  # default 25MB
 UPLOAD_CHUNK_BYTES = 1024 * 1024  # 1MB chunks
+_chat_generation_locks: dict[str, asyncio.Lock] = {}
 
 
 class EmbeddingRequest(BaseModel):
@@ -174,6 +187,41 @@ def _normalize_stop(stop: str | list[str] | None) -> list[str] | None:
     return [s for s in stop if s]
 
 
+async def _prepare_chat_request(
+    model: Any,
+    messages: list[dict[str, Any]],
+    executor: Any,
+) -> tuple[dict[str, Any] | None, int]:
+    """Tokenize once for both counting and generation when supported by the model.
+
+    Runs heavy tokenizer work inside the chat executor to avoid blocking the event loop.
+    """
+
+    loop = asyncio.get_running_loop()
+    prepare_timeout = float(os.getenv("CHAT_PREPARE_TIMEOUT_SEC", "10"))
+    if hasattr(model, "prepare_inputs"):
+        try:
+            prepared, prompt_tokens = await asyncio.wait_for(
+                loop.run_in_executor(
+                    executor,
+                    lambda: model.prepare_inputs(messages, add_generation_prompt=True),
+                ),
+                timeout=prepare_timeout,
+            )
+            return prepared, prompt_tokens
+        except Exception as exc:  # pragma: no cover - defensive
+            logger.warning(
+                "chat_prepare_inputs_failed",
+                extra={"model": getattr(model, "name", "unknown"), "error": str(exc)},
+            )
+
+    prompt_tokens = await asyncio.wait_for(
+        loop.run_in_executor(executor, lambda: model.count_tokens(messages)),
+        timeout=prepare_timeout,
+    )
+    return None, int(prompt_tokens)
+
+
 async def _save_upload(file: UploadFile, max_bytes: int = MAX_AUDIO_BYTES) -> tuple[str, int]:
     """Persist UploadFile to a temp file and enforce size guard."""
     suffix = Path(file.filename or "").suffix or ".wav"
@@ -220,6 +268,14 @@ def _select_granularity(values: list[str] | None) -> Literal["word", "segment", 
     if "segment" in lowered:
         return "segment"
     return None
+
+
+def _get_chat_lock(model: str) -> asyncio.Lock:
+    lock = _chat_generation_locks.get(model)
+    if lock is None:
+        lock = asyncio.Lock()
+        _chat_generation_locks[model] = lock
+    return lock
 
 
 def _format_ts(seconds: float, *, sep: str = ",") -> str:
@@ -270,6 +326,14 @@ class WarmupDetails(BaseModel):
     required: bool
     completed: bool
     failures: list[str] | None = None
+    ok_models: list[str] | None = None
+    capabilities: dict[str, dict[str, bool]] | None = None
+
+
+class QueueDepth(BaseModel):
+    model: str
+    size: int
+    max_size: int | None = None
 
 
 class HealthResponse(BaseModel):
@@ -277,6 +341,8 @@ class HealthResponse(BaseModel):
     models: list[str] | None = None
     warmup_failures: list[str] | None = None
     warmup: WarmupDetails | None = None
+    chat_batch_queues: list[QueueDepth] | None = None
+    embedding_batch_queues: list[QueueDepth] | None = None
 
 
 @router.post("/v1/embeddings", response_model=EmbeddingResponse)
@@ -308,6 +374,7 @@ async def create_embeddings(
             )
 
     start = time.perf_counter()
+    label_token = set_queue_label(req.model or "embedding")
     try:
         async with limiter():
             try:
@@ -361,6 +428,8 @@ async def create_embeddings(
             detail="Timed out waiting for worker",
             headers={"Retry-After": str(int(QUEUE_TIMEOUT_SEC))},
         ) from exc
+    finally:
+        reset_queue_label(label_token)
 
     latency = time.perf_counter() - start
     observe_latency(req.model, latency)
@@ -408,6 +477,7 @@ async def create_chat_completions(  # noqa: PLR0915, PLR0912
     stop = _normalize_stop(req.stop)
 
     start = time.perf_counter()
+    label_token = set_queue_label(req.model or "chat")
     try:
         async with limiter():
             try:
@@ -449,6 +519,14 @@ async def create_chat_completions(  # noqa: PLR0915, PLR0912
 
             loop = asyncio.get_running_loop()
             executor = get_chat_executor()
+            max_prompt_tokens = int(os.getenv("CHAT_MAX_PROMPT_TOKENS", "4096"))
+            prepared_inputs, prompt_tokens = await _prepare_chat_request(model, raw_messages, executor)
+            if prompt_tokens > max_prompt_tokens:
+                record_chat_request(req.model, "400")
+                raise HTTPException(
+                    status_code=status.HTTP_400_BAD_REQUEST,
+                    detail=f"Prompt too long; max {max_prompt_tokens} tokens",
+                )
             generation: ChatGeneration | None = None
             batcher = getattr(_request.app.state, "chat_batching_service", None)
             if (
@@ -464,6 +542,8 @@ async def create_chat_completions(  # noqa: PLR0915, PLR0912
                         temperature=temperature,
                         top_p=top_p,
                         stop=stop,
+                        prompt_tokens=prompt_tokens,
+                        prepared_inputs=prepared_inputs,
                     )
                 except ValueError as exc:
                     record_chat_request(req.model, "400")
@@ -481,6 +561,16 @@ async def create_chat_completions(  # noqa: PLR0915, PLR0912
                         detail="Chat batch queue full",
                         headers={"Retry-After": str(int(QUEUE_TIMEOUT_SEC))},
                     ) from exc
+                except ChatBatchQueueTimeoutError as exc:
+                    record_chat_request(req.model, "429")
+                    logger.info(
+                        "chat_batch_queue_timeout", extra={"model": req.model, "status": 429}
+                    )
+                    raise HTTPException(
+                        status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+                        detail="Chat batch queue wait exceeded",
+                        headers={"Retry-After": str(int(QUEUE_TIMEOUT_SEC))},
+                    ) from exc
                 except Exception as exc:  # pragma: no cover - defensive fallback
                     logger.warning(
                         "chat_batcher_failed_falling_back",
@@ -490,16 +580,30 @@ async def create_chat_completions(  # noqa: PLR0915, PLR0912
 
             if generation is None:
                 try:
-                    generation = await loop.run_in_executor(
-                        executor,
-                        lambda: model.generate(
-                            raw_messages,
-                            max_new_tokens=max_tokens,
-                            temperature=temperature,
-                            top_p=top_p,
-                            stop=stop,
-                        ),
-                    )
+                    lock = _get_chat_lock(req.model)
+                    async with lock:
+                        if prepared_inputs is not None and hasattr(model, "generate_prepared"):
+                            generation = await loop.run_in_executor(
+                                executor,
+                                lambda: model.generate_prepared(
+                                    prepared_inputs,
+                                    max_new_tokens=max_tokens,
+                                    temperature=temperature,
+                                    top_p=top_p,
+                                    stop=stop,
+                                ),
+                            )
+                        else:
+                            generation = await loop.run_in_executor(
+                                executor,
+                                lambda: model.generate(
+                                    raw_messages,
+                                    max_new_tokens=max_tokens,
+                                    temperature=temperature,
+                                    top_p=top_p,
+                                    stop=stop,
+                                ),
+                            )
                 except Exception as exc:  # pragma: no cover - unexpected runtime failure
                     record_chat_request(req.model, "500")
                     logger.exception(
@@ -536,6 +640,8 @@ async def create_chat_completions(  # noqa: PLR0915, PLR0912
             detail="Timed out waiting for worker",
             headers={"Retry-After": str(int(QUEUE_TIMEOUT_SEC))},
         ) from exc
+    finally:
+        reset_queue_label(label_token)
 
     latency = time.perf_counter() - start
     observe_chat_latency(req.model, latency)
@@ -551,7 +657,11 @@ async def create_chat_completions(  # noqa: PLR0915, PLR0912
     )
 
     completion_tokens = generation.completion_tokens or 0
-    prompt_tokens = generation.prompt_tokens or 0
+    prompt_tokens = (
+        generation.prompt_tokens
+        if generation.prompt_tokens is not None
+        else prompt_tokens  # fall back to pre-check count
+    )
     usage = Usage(
         prompt_tokens=prompt_tokens,
         completion_tokens=completion_tokens,
@@ -601,12 +711,13 @@ async def _handle_audio_request(  # noqa: PLR0912, PLR0913, PLR0915
     temp_path: str | None = None
     size_bytes = 0
     duration: float | None = None
+    label_token = set_audio_queue_label(model_name or "audio")
 
     try:
         temp_path, size_bytes = await _save_upload(file)
         duration = _probe_duration(temp_path)
 
-        async with limiter():
+        async with audio_limiter():
             try:
                 model = registry.get(model_name)
             except KeyError as exc:
@@ -622,7 +733,7 @@ async def _handle_audio_request(  # noqa: PLR0912, PLR0913, PLR0915
                 )
 
             loop = asyncio.get_running_loop()
-            executor = get_chat_executor()
+            executor = get_audio_executor()
             try:
                 result = await loop.run_in_executor(
                     executor,
@@ -645,27 +756,28 @@ async def _handle_audio_request(  # noqa: PLR0912, PLR0913, PLR0915
                     status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
                     detail="Audio processing failed",
                 ) from exc
-    except QueueFullError as exc:
+    except AudioQueueFullError as exc:
         record_audio_request(model_name, "429")
         raise HTTPException(
             status_code=status.HTTP_429_TOO_MANY_REQUESTS,
             detail="Request queue full",
-            headers={"Retry-After": str(int(QUEUE_TIMEOUT_SEC))},
+            headers={"Retry-After": str(int(AUDIO_QUEUE_TIMEOUT_SEC))},
         ) from exc
-    except ShuttingDownError as exc:
+    except AudioShuttingDownError as exc:
         record_audio_request(model_name, "503")
         raise HTTPException(
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
             detail="Service is shutting down",
         ) from exc
-    except QueueTimeoutError as exc:
+    except AudioQueueTimeoutError as exc:
         record_audio_request(model_name, "429")
         raise HTTPException(
             status_code=status.HTTP_429_TOO_MANY_REQUESTS,
             detail="Timed out waiting for worker",
-            headers={"Retry-After": str(int(QUEUE_TIMEOUT_SEC))},
+            headers={"Retry-After": str(int(AUDIO_QUEUE_TIMEOUT_SEC))},
         ) from exc
     finally:
+        reset_audio_queue_label(label_token)
         if temp_path:
             with contextlib.suppress(Exception):
                 Path(temp_path).unlink(missing_ok=True)
@@ -803,7 +915,26 @@ async def health(
         required=warmup_status.required,
         completed=warmup_status.completed,
         failures=warmup_failures or None,
+        ok_models=warmup_status.ok_models or None,
+        capabilities=warmup_status.capabilities or None,
     )
+
+    chat_queue_depths: list[QueueDepth] | None = None
+    embed_queue_depths: list[QueueDepth] | None = None
+
+    chat_batcher = getattr(request.app.state, "chat_batching_service", None)
+    if chat_batcher and getattr(chat_batcher, "queue_stats", None):
+        chat_queue_depths = [
+            QueueDepth(model=name, size=size, max_size=max_size)
+            for name, (size, max_size) in chat_batcher.queue_stats().items()
+        ]
+
+    embed_batcher = getattr(request.app.state, "batching_service", None)
+    if embed_batcher and getattr(embed_batcher, "queue_stats", None):
+        embed_queue_depths = [
+            QueueDepth(model=name, size=size, max_size=max_size)
+            for name, (size, max_size) in embed_batcher.queue_stats().items()
+        ]
 
     health_status = "ok"
     http_status = status.HTTP_200_OK
@@ -816,6 +947,8 @@ async def health(
         models=models,
         warmup_failures=warmup_failures or None,
         warmup=warmup_details,
+        chat_batch_queues=chat_queue_depths,
+        embedding_batch_queues=embed_queue_depths,
     )
 
     if http_status != status.HTTP_200_OK:

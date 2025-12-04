@@ -10,20 +10,23 @@ import numpy as np
 
 from app.models.registry import ModelRegistry
 from app.threadpool import get_embedding_executor
+from app.monitoring.metrics import observe_embedding_batch_wait
 
 
 class _BatchItem:
     def __init__(self, texts: list[str], future: asyncio.Future[np.ndarray]) -> None:
         self.texts = texts
         self.future = future
+        self.enqueue_time = asyncio.get_running_loop().time()
 
 
 class ModelBatcher:
-    def __init__(self, model: Any, max_batch: int, window_ms: float) -> None:
+    def __init__(self, model: Any, max_batch: int, window_ms: float, queue_size: int) -> None:
         self.model = model
         self.max_batch = max_batch
         self.window = max(window_ms / 1000.0, 0.0)
-        self.queue: asyncio.Queue[_BatchItem] = asyncio.Queue()
+        # Bounded queue prevents unbounded memory growth under bursty load.
+        self.queue: asyncio.Queue[_BatchItem] = asyncio.Queue(max(queue_size, 1))
         self._task: asyncio.Task[None] | None = None
 
     async def enqueue(self, texts: list[str]) -> np.ndarray:
@@ -78,6 +81,10 @@ class ModelBatcher:
             # Split outputs per request
             offset = 0
             for bi, size in zip(batch_items, sizes, strict=False):
+                try:
+                    observe_embedding_batch_wait(getattr(self.model, "name", "unknown"), loop.time() - bi.enqueue_time)
+                except Exception:
+                    pass
                 if not bi.future.done():
                     bi.future.set_result(vectors[offset : offset + size])
                 offset += size
@@ -100,17 +107,26 @@ class BatchingService:
         enabled: bool = True,
         max_batch_size: int | None = None,
         window_ms: float | None = None,
+        queue_size: int | None = None,
     ) -> None:
         self.enabled = enabled
         self.max_batch_size = max_batch_size or int(
             os.getenv("BATCH_WINDOW_MAX_SIZE", os.getenv("BATCH_MAX_SIZE", os.getenv("MAX_BATCH_SIZE", "32")))
         )
-        self.window_ms = window_ms if window_ms is not None else float(os.getenv("BATCH_WINDOW_MS", "0"))
+        self.window_ms = window_ms if window_ms is not None else float(os.getenv("BATCH_WINDOW_MS", "6"))
+        self.queue_size = queue_size if queue_size is not None else int(
+            os.getenv("EMBEDDING_BATCH_QUEUE_SIZE", os.getenv("BATCH_QUEUE_SIZE", os.getenv("MAX_QUEUE_SIZE", "64")))
+        )
         self._batchers: dict[str, ModelBatcher] = {}
         for name in registry.list_models():
             model = registry.get(name)
             if "text-embedding" in getattr(model, "capabilities", []):
-                self._batchers[name] = ModelBatcher(model, self.max_batch_size, self.window_ms)
+                self._batchers[name] = ModelBatcher(
+                    model,
+                    self.max_batch_size,
+                    self.window_ms,
+                    self.queue_size,
+                )
 
     async def enqueue(self, model_name: str, texts: list[str]) -> np.ndarray:
         if not self.enabled:
@@ -122,3 +138,14 @@ class BatchingService:
     async def stop(self) -> None:
         for batcher in self._batchers.values():
             await batcher.stop()
+
+    def queue_stats(self) -> dict[str, tuple[int, int | None]]:
+        """Return current queue sizes for each embedding batcher."""
+
+        stats: dict[str, tuple[int, int | None]] = {}
+        for name, batcher in self._batchers.items():
+            size = batcher.queue.qsize()
+            # asyncio.Queue default maxsize of 0 means unbounded; expose None instead.
+            max_size = batcher.queue.maxsize or None
+            stats[name] = (size, max_size)
+        return stats

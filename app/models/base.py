@@ -45,6 +45,33 @@ class ChatModel(Protocol):
         stop: list[str] | None = None,
     ) -> ChatGeneration: ...
 
+    def prepare_inputs(
+        self,
+        messages: Sequence[dict[str, Any]],
+        *,
+        add_generation_prompt: bool = True,
+    ) -> tuple[dict[str, Any], int]: ...
+
+    def generate_prepared(
+        self,
+        prepared: dict[str, Any],
+        *,
+        max_new_tokens: int,
+        temperature: float,
+        top_p: float,
+        stop: list[str] | None = None,
+    ) -> ChatGeneration: ...
+
+    def batched_generate_prepared(
+        self,
+        prepared_list: list[dict[str, Any]],
+        *,
+        max_new_tokens: int,
+        temperature: float,
+        top_p: float,
+        stop: list[str] | None = None,
+    ) -> list[ChatGeneration]: ...
+
     def count_tokens(self, messages: Sequence[dict[str, Any]]) -> int: ...
 
 

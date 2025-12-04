@@ -1,17 +1,21 @@
 from __future__ import annotations
 
+import atexit
 import base64
 import importlib
 import io
 import logging
 import os
-import urllib.request
+import threading
+import urllib.parse
 from collections.abc import Sequence
 from pathlib import Path
 from typing import Any
 
 import torch
 from PIL import Image
+import httpx
+import threading
 from transformers import (
     AutoModelForCausalLM,
     AutoProcessor,
@@ -23,6 +27,8 @@ from transformers import (
 from app.models.base import ChatGeneration, ChatModel
 
 logger = logging.getLogger(__name__)
+_HTTP_CLIENT: httpx.Client | None = None
+_HTTP_CLIENT_LOCK = threading.Lock()
 
 
 class _StopOnTokens(StoppingCriteria):
@@ -51,8 +57,10 @@ class QwenVLChat(ChatModel):
     def __init__(self, hf_repo_id: str, device: str = "auto") -> None:
         self.name = hf_repo_id
         self.capabilities = ["chat-completion", "vision"]
-        self.device = device
+        self.device = self._resolve_runtime_device(device)
         self.hf_repo_id = hf_repo_id
+        self._gen_lock = threading.Lock()
+        self.thread_safe = True
         models_dir = Path(__file__).resolve().parent.parent.parent / "models"
         self.cache_dir = str(models_dir) if models_dir.exists() else os.environ.get("HF_HOME")
 
@@ -81,7 +89,7 @@ class QwenVLChat(ChatModel):
             dtype="auto",
         )
         # If we didn't use device_map auto, place on requested device.
-        if device_map is None and device != "auto":
+        if device_map is None:
             self.model.to(self.device)
         self.model.eval()
 
@@ -95,47 +103,82 @@ class QwenVLChat(ChatModel):
         top_p: float,
         stop: list[str] | None = None,
     ) -> ChatGeneration:
-        qwen_messages = self._to_qwen_messages(messages)
-        stop_criteria, stop_flag = self._build_stop_criteria(stop)
+        with self._gen_lock:
+            stop_criteria, stop_flag = self._build_stop_criteria(stop)
+            prepared_inputs, prompt_len = self.prepare_inputs(messages, add_generation_prompt=True)
+            inputs = {k: v.to(self.model.device) for k, v in prepared_inputs.items() if k != "_prompt_len"}
 
-        inputs = self.processor.apply_chat_template(
-            qwen_messages,
-            tokenize=True,
-            add_generation_prompt=True,
-            return_tensors="pt",
-            return_dict=True,
-        )
-        inputs = inputs.to(self.model.device)
+            generation_kwargs: dict[str, Any] = {
+                "max_new_tokens": max_new_tokens,
+                "do_sample": temperature > 0,
+                "temperature": temperature,
+                "top_p": top_p,
+            }
+            if stop_criteria is not None:
+                generation_kwargs["stopping_criteria"] = stop_criteria
 
-        generation_kwargs: dict[str, Any] = {
-            "max_new_tokens": max_new_tokens,
-            "do_sample": temperature > 0,
-            "temperature": temperature,
-            "top_p": top_p,
-        }
-        if stop_criteria is not None:
-            generation_kwargs["stopping_criteria"] = stop_criteria
+            with torch.inference_mode():
+                output_ids = self.model.generate(**inputs, **generation_kwargs)
 
-        with torch.no_grad():
-            output_ids = self.model.generate(**inputs, **generation_kwargs)
+            generated_ids = output_ids[:, prompt_len:]
+            completion_tokens = int(generated_ids.shape[1])
+            finish_reason = "length" if completion_tokens >= max_new_tokens else "stop"
+            stop_hit = bool(stop_flag and stop_flag.triggered)
 
-        prompt_len = int(inputs["input_ids"].shape[1])
-        generated_ids = output_ids[:, prompt_len:]
-        completion_tokens = int(generated_ids.shape[1])
-        finish_reason = "length" if completion_tokens >= max_new_tokens else "stop"
-        stop_hit = bool(stop_flag and stop_flag.triggered)
+            text = self.processor.batch_decode(generated_ids, skip_special_tokens=True)[0]
+            text, trimmed = self._trim_with_stop(text, stop)
+            if trimmed:
+                stop_hit = True
 
-        text = self.processor.batch_decode(generated_ids, skip_special_tokens=True)[0]
-        text, trimmed = self._trim_with_stop(text, stop)
-        if trimmed:
-            stop_hit = True
+            return ChatGeneration(
+                text=text.strip(),
+                prompt_tokens=prompt_len,
+                completion_tokens=completion_tokens,
+                finish_reason="stop" if stop_hit else finish_reason,
+            )
 
-        return ChatGeneration(
-            text=text.strip(),
-            prompt_tokens=prompt_len,
-            completion_tokens=completion_tokens,
-            finish_reason="stop" if stop_hit else finish_reason,
-        )
+    def generate_prepared(
+        self,
+        prepared: dict[str, Any],
+        *,
+        max_new_tokens: int,
+        temperature: float,
+        top_p: float,
+        stop: list[str] | None = None,
+    ) -> ChatGeneration:
+        with self._gen_lock:
+            stop_criteria, stop_flag = self._build_stop_criteria(stop)
+            prompt_len = int(prepared.get("_prompt_len") or prepared["input_ids"].shape[1])
+            inputs = {k: v.to(self.model.device) for k, v in prepared.items() if k != "_prompt_len"}
+
+            generation_kwargs: dict[str, Any] = {
+                "max_new_tokens": max_new_tokens,
+                "do_sample": temperature > 0,
+                "temperature": temperature,
+                "top_p": top_p,
+            }
+            if stop_criteria is not None:
+                generation_kwargs["stopping_criteria"] = stop_criteria
+
+            with torch.inference_mode():
+                output_ids = self.model.generate(**inputs, **generation_kwargs)
+
+            generated_ids = output_ids[:, prompt_len:]
+            completion_tokens = int(generated_ids.shape[1])
+            finish_reason = "length" if completion_tokens >= max_new_tokens else "stop"
+            stop_hit = bool(stop_flag and stop_flag.triggered)
+
+            text = self.processor.batch_decode(generated_ids, skip_special_tokens=True)[0]
+            text, trimmed = self._trim_with_stop(text, stop)
+            if trimmed:
+                stop_hit = True
+
+            return ChatGeneration(
+                text=text.strip(),
+                prompt_tokens=prompt_len,
+                completion_tokens=completion_tokens,
+                finish_reason="stop" if stop_hit else finish_reason,
+            )
 
     # ----------- Helpers ----------------------------------------------------
     def _resolve_model_cls(self) -> Any:
@@ -175,6 +218,17 @@ class QwenVLChat(ChatModel):
             )
             return None
 
+    def _resolve_runtime_device(self, preference: str) -> str:
+        pref = (preference or "auto").lower()
+        if pref != "auto":
+            return preference
+        backends = getattr(torch, "backends", None)
+        if getattr(torch.cuda, "is_available", lambda: False)():
+            return "cuda"
+        if backends and getattr(backends, "mps", None) and backends.mps.is_available():
+            return "mps"
+        return "cpu"
+
     def count_tokens(self, messages: Sequence[dict[str, Any]]) -> int:
         qwen_messages = self._to_qwen_messages(messages)
         encoded = self.processor.apply_chat_template(
@@ -184,6 +238,46 @@ class QwenVLChat(ChatModel):
             return_tensors="pt",
         )
         return int(encoded["input_ids"].shape[1])
+
+    def batched_generate_prepared(
+        self,
+        prepared_list: list[dict[str, Any]],
+        *,
+        max_new_tokens: int,
+        temperature: float,
+        top_p: float,
+        stop: list[str] | None = None,
+    ) -> list[ChatGeneration]:
+        # Vision models are not batched by default; fall back to sequential generation.
+        with self._gen_lock:
+            return [
+                self.generate_prepared(
+                    prepared,
+                    max_new_tokens=max_new_tokens,
+                    temperature=temperature,
+                    top_p=top_p,
+                    stop=stop,
+                )
+                for prepared in prepared_list
+            ]
+
+    def prepare_inputs(
+        self,
+        messages: Sequence[dict[str, Any]],
+        *,
+        add_generation_prompt: bool = True,
+    ) -> tuple[dict[str, Any], int]:
+        qwen_messages = self._to_qwen_messages(messages)
+        inputs = self.processor.apply_chat_template(
+            qwen_messages,
+            tokenize=True,
+            add_generation_prompt=add_generation_prompt,
+            return_tensors="pt",
+            return_dict=True,
+        )
+        prompt_len = int(inputs["input_ids"].shape[1])
+        inputs["_prompt_len"] = prompt_len
+        return inputs, prompt_len
 
     # ----------- Helpers ----------------------------------------------------
     def _build_stop_criteria(
@@ -250,11 +344,18 @@ class QwenVLChat(ChatModel):
         return text[:earliest_idx].rstrip(), True
 
     def _load_image(self, source: str) -> Image.Image:
-        """Load an image from a data URI, remote URL, or local path."""
+        """Load an image from a data URI, remote URL, or local path.
+
+        Remote fetch is disabled by default and, when enabled, uses a pooled HTTP client
+        plus head checks for MIME/length and streaming with a byte budget to avoid
+        blocking executor threads.
+        """
 
         max_bytes = int(os.getenv("MAX_REMOTE_IMAGE_BYTES", str(5 * 1024 * 1024)))
         remote_timeout = float(os.getenv("REMOTE_IMAGE_TIMEOUT", "5"))
         allow_remote = os.getenv("ALLOW_REMOTE_IMAGES", "0") != "0"
+        host_allowlist = {h.strip() for h in os.getenv("REMOTE_IMAGE_HOST_ALLOWLIST", "").split(",") if h.strip()}
+        mime_allowlist = {m.strip().lower() for m in os.getenv("REMOTE_IMAGE_MIME_ALLOWLIST", "image/png,image/jpeg,image/webp,image/gif").split(",") if m.strip()}
 
         if source.startswith("data:"):
             try:
@@ -269,14 +370,58 @@ class QwenVLChat(ChatModel):
         if source.startswith("http://") or source.startswith("https://"):
             if not allow_remote:
                 raise ValueError("Remote image URLs are disabled (set ALLOW_REMOTE_IMAGES=1 to enable)")
-            with urllib.request.urlopen(source, timeout=remote_timeout) as resp:  # noqa: S310
-                data = resp.read(max_bytes + 1)
-            if max_bytes and len(data) > max_bytes:
+
+            parsed = urllib.parse.urlparse(source)
+            if host_allowlist and parsed.hostname not in host_allowlist:
+                raise ValueError("Remote image host not allowed")
+
+            client = _get_http_client(timeout=remote_timeout)
+
+            # HEAD for MIME/length validation
+            head_resp = client.head(source, follow_redirects=True, timeout=remote_timeout)
+            content_length = int(head_resp.headers.get("content-length", "0") or 0)
+            if max_bytes and content_length and content_length > max_bytes:
                 raise ValueError("Remote image too large")
-            return Image.open(io.BytesIO(data)).convert("RGB")
+            content_type = (head_resp.headers.get("content-type") or "").split(";")[0].lower()
+            if mime_allowlist and content_type and content_type not in mime_allowlist:
+                raise ValueError("Remote image MIME not allowed")
+
+            with client.stream("GET", source, follow_redirects=True, timeout=remote_timeout) as resp:
+                resp.raise_for_status()
+                buf = io.BytesIO()
+                for chunk in resp.iter_bytes(chunk_size=64 * 1024):
+                    if not chunk:
+                        break
+                    buf.write(chunk)
+                    if max_bytes and buf.tell() > max_bytes:
+                        raise ValueError("Remote image too large")
+                buf.seek(0)
+                return Image.open(buf).convert("RGB")
 
         # Assume local file path
         path = Path(source).expanduser()
         if not path.exists():
             raise FileNotFoundError(f"Image not found at path: {source}")
         return Image.open(path).convert("RGB")
+
+
+def _get_http_client(*, timeout: float) -> httpx.Client:
+    """Return a shared httpx client with connection pooling.
+
+    The client is created lazily and closed at process exit. Access is guarded by a
+    lock to remain safe under multi-threaded callers (e.g., chat thread pools).
+    """
+
+    global _HTTP_CLIENT
+    if _HTTP_CLIENT is not None:
+        return _HTTP_CLIENT
+
+    with _HTTP_CLIENT_LOCK:
+        if _HTTP_CLIENT is None:
+            _HTTP_CLIENT = httpx.Client(
+                timeout=timeout,
+                limits=httpx.Limits(max_keepalive_connections=8, max_connections=16),
+                follow_redirects=True,
+            )
+            atexit.register(_HTTP_CLIENT.close)
+        return _HTTP_CLIENT

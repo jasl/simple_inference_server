@@ -12,6 +12,8 @@ class WarmupStatus:
     required: bool = False
     completed: bool = False
     failures: list[str] = field(default_factory=list)
+    ok_models: list[str] = field(default_factory=list)
+    capabilities: dict[str, dict[str, bool]] = field(default_factory=dict)
 
 # Global holder for the loaded ModelRegistry instance.
 model_registry: ModelRegistry | None = None
