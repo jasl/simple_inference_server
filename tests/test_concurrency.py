@@ -8,15 +8,16 @@ from app.concurrency import limiter
 
 
 async def _use_limiter(limiter_module: Any, delay: float = 0.05) -> None:
-    async with limiter_module.limiter():
+    async with limiter_module.embedding_limiter():
         await asyncio.sleep(delay)
 
 
 def test_queue_full(monkeypatch: pytest.MonkeyPatch) -> None:
-    # Reduce limits to make the test quick and predictable
-    monkeypatch.setenv("MAX_CONCURRENT", "1")
-    monkeypatch.setenv("MAX_QUEUE_SIZE", "2")
-    monkeypatch.setenv("QUEUE_TIMEOUT_SEC", "0.2")
+    # Reduce limits to make the test quick and predictable.
+    # Use embedding-specific settings since we're testing embedding_limiter.
+    monkeypatch.setenv("EMBEDDING_MAX_CONCURRENT", "1")
+    monkeypatch.setenv("EMBEDDING_MAX_QUEUE_SIZE", "2")
+    monkeypatch.setenv("EMBEDDING_QUEUE_TIMEOUT_SEC", "0.2")
 
     importlib.reload(limiter)
 

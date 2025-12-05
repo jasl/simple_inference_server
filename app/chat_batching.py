@@ -17,6 +17,7 @@ import torch
 from app.monitoring.metrics import (
     observe_chat_batch_size,
     observe_chat_batch_wait,
+    record_chat_batch_degraded_max_size,
     record_chat_batch_oom_retry,
     record_chat_batch_queue,
     record_chat_batch_queue_rejection,
@@ -36,6 +37,7 @@ _QUEUE_MAX_WAIT_SEC = float(os.getenv("CHAT_QUEUE_MAX_WAIT_MS", "2000")) / 1000.
 _REQUEUE_MAX_TASKS = int(os.getenv("CHAT_REQUEUE_MAX_TASKS", "64"))
 _PREPARE_TIMEOUT_SEC = float(os.getenv("CHAT_PREPARE_TIMEOUT_SEC", "10"))
 _GENERATE_TIMEOUT_SEC = float(os.getenv("CHAT_GENERATE_TIMEOUT_SEC", "60"))
+_OOM_COOLDOWN_SEC = float(os.getenv("CHAT_OOM_COOLDOWN_SEC", "300"))  # 5 minutes default
 
 
 @dataclass
@@ -81,6 +83,9 @@ class ChatBatcher:
         self._stopping = False
         self.oom_retries = 0
         self._requeue_tasks: set[asyncio.Task[None]] = set()
+        # OOM graceful degradation state
+        self._current_max_batch = max_batch
+        self._oom_cooldown_until: float | None = None
 
     async def enqueue(  # noqa: PLR0913 - explicit params keep batching contract clear
         self,
@@ -151,16 +156,51 @@ class ChatBatcher:
             raise ChatBatchQueueFullError("Chat batch queue is full") from exc
         return await fut
 
+    def _check_oom_recovery(self) -> None:
+        """Check if OOM cooldown has expired and restore original batch size."""
+        if self._oom_cooldown_until is None:
+            return
+        if time.perf_counter() >= self._oom_cooldown_until:
+            logger.info(
+                "chat_batch_oom_recovery",
+                extra={
+                    "model": self.model_name,
+                    "restored_max_batch": self.max_batch,
+                    "previous_max_batch": self._current_max_batch,
+                },
+            )
+            self._current_max_batch = self.max_batch
+            self._oom_cooldown_until = None
+            record_chat_batch_degraded_max_size(self.model_name, self._current_max_batch)
+
+    def _handle_oom_degradation(self) -> None:
+        """Halve the batch size on OOM and set cooldown."""
+        previous = self._current_max_batch
+        self._current_max_batch = max(1, self._current_max_batch // 2)
+        self._oom_cooldown_until = time.perf_counter() + _OOM_COOLDOWN_SEC
+        logger.warning(
+            "chat_batch_oom_degradation",
+            extra={
+                "model": self.model_name,
+                "previous_max_batch": previous,
+                "degraded_max_batch": self._current_max_batch,
+                "cooldown_sec": _OOM_COOLDOWN_SEC,
+            },
+        )
+        record_chat_batch_degraded_max_size(self.model_name, self._current_max_batch)
+
     async def _worker(self) -> None:  # noqa: PLR0912, PLR0915 - batching loop keeps several branches for fairness/backpressure
         loop = asyncio.get_running_loop()
         executor = get_chat_executor()
         try:
             while True:
                 first = await self.queue.get()
+                # Check OOM recovery before processing new batch
+                self._check_oom_recovery()
                 candidates = [first]
                 start = time.perf_counter()
-                # Pull up to max_batch items within the window, regardless of config.
-                while len(candidates) < self.max_batch:
+                # Pull up to _current_max_batch items within the window (may be reduced due to OOM).
+                while len(candidates) < self._current_max_batch:
                     remaining = self.window - (time.perf_counter() - start)
                     if remaining <= 0:
                         break
@@ -296,6 +336,8 @@ class ChatBatcher:
             record_chat_batch_oom_retry(self.model_name)
             if torch.cuda.is_available():
                 torch.cuda.empty_cache()
+            # Apply graceful degradation: halve batch size for future batches
+            self._handle_oom_degradation()
             if len(batch_items) == 1:
                 raise
             # Retry sequentially to reduce peak memory.

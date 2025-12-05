@@ -1,10 +1,62 @@
 from __future__ import annotations
 
+import contextlib
+import logging
 import threading
 from typing import Any
 
 import torch
 from transformers import StoppingCriteria
+
+logger = logging.getLogger(__name__)
+
+
+def resolve_runtime_device(preference: str) -> str:
+    """Resolve device preference to a concrete device string.
+
+    Args:
+        preference: Device preference string ("auto", "cpu", "cuda", "mps", etc.)
+
+    Returns:
+        Resolved device string
+    """
+    pref = (preference or "auto").lower()
+    if pref != "auto":
+        return preference
+    backends = getattr(torch, "backends", None)
+    if getattr(torch.cuda, "is_available", lambda: False)():
+        return "cuda"
+    if backends and getattr(backends, "mps", None) and backends.mps.is_available():
+        return "mps"
+    return "cpu"
+
+
+def handle_oom(exc: BaseException, model_name: str, device: Any) -> None:
+    """Handle CUDA OOM in a consistent, recoverable way.
+
+    Logs the exception, clears CUDA cache if available, and re-raises.
+    Chat batching and API layers will interpret the re-raised exception as a
+    generic generation failure and surface a 500 error.
+
+    Args:
+        exc: The OOM exception
+        model_name: Name of the model that triggered OOM
+        device: Device the model is running on
+
+    Raises:
+        The original exception after cleanup
+    """
+    logger.exception(
+        "chat_generate_oom",
+        extra={
+            "model": model_name,
+            "device": str(device) if device else "unknown",
+        },
+    )
+    if torch.cuda.is_available():
+        with contextlib.suppress(Exception):
+            torch.cuda.empty_cache()
+    raise exc
 
 
 class StopOnTokens(StoppingCriteria):

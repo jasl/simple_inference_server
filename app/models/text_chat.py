@@ -1,7 +1,5 @@
 from __future__ import annotations
 
-import contextlib
-import importlib
 import importlib.util as importlib_util
 import logging
 import os
@@ -18,7 +16,14 @@ from transformers import (
 )
 
 from app.models.base import ChatGeneration, ChatModel
-from app.models.generation_utils import StopOnCancel, StopOnCancelAny, StopOnTokens, trim_with_stop
+from app.models.generation_utils import (
+    StopOnCancel,
+    StopOnCancelAny,
+    StopOnTokens,
+    handle_oom,
+    resolve_runtime_device,
+    trim_with_stop,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -29,7 +34,7 @@ class TextChatModel(ChatModel):
     def __init__(self, hf_repo_id: str, device: str = "auto") -> None:
         self.name = hf_repo_id
         self.capabilities = ["chat-completion"]
-        self.device = self._resolve_runtime_device(device)
+        self.device = resolve_runtime_device(device)
         self.hf_repo_id = hf_repo_id
         self.thread_safe = True
 
@@ -88,7 +93,7 @@ class TextChatModel(ChatModel):
             with torch.inference_mode():
                 output_ids = self.model.generate(**inputs, **gen_kwargs)
         except (torch.cuda.OutOfMemoryError, torch.OutOfMemoryError) as exc:
-            self._handle_oom(exc)
+            handle_oom(exc, self.hf_repo_id, getattr(self.model, "device", None))
 
         generated_ids = output_ids[:, prompt_len:]
         completion_tokens = int(generated_ids.shape[1])
@@ -137,7 +142,7 @@ class TextChatModel(ChatModel):
             with torch.inference_mode():
                 output_ids = self.model.generate(**inputs, **gen_kwargs)
         except (torch.cuda.OutOfMemoryError, torch.OutOfMemoryError) as exc:
-            self._handle_oom(exc)
+            handle_oom(exc, self.hf_repo_id, getattr(self.model, "device", None))
 
         generated_ids = output_ids[:, prompt_len:]
         completion_tokens = int(generated_ids.shape[1])
@@ -200,7 +205,7 @@ class TextChatModel(ChatModel):
             with torch.inference_mode():
                 output_ids = self.model.generate(**inputs, **gen_kwargs)
         except (torch.cuda.OutOfMemoryError, torch.OutOfMemoryError) as exc:
-            self._handle_oom(exc)
+            handle_oom(exc, self.hf_repo_id, getattr(self.model, "device", None))
 
         generations: list[ChatGeneration] = []
         for idx, prompt_len in enumerate(prompt_lengths):
@@ -264,7 +269,7 @@ class TextChatModel(ChatModel):
             with torch.inference_mode():
                 output_ids = self.model.generate(**inputs, **gen_kwargs)
         except (torch.cuda.OutOfMemoryError, torch.OutOfMemoryError) as exc:
-            self._handle_oom(exc)
+            handle_oom(exc, self.hf_repo_id, getattr(self.model, "device", None))
 
         generations: list[ChatGeneration] = []
         for idx, prompt_len in enumerate(prompt_lengths):
@@ -292,7 +297,7 @@ class TextChatModel(ChatModel):
         if isinstance(raw_inputs, dict):
             return self._ensure_2d(raw_inputs)
         # BatchEncoding behaves like dict for .items()
-        if hasattr(raw_inputs, "data") and isinstance(getattr(raw_inputs, "data"), dict):
+        if hasattr(raw_inputs, "data") and isinstance(raw_inputs.data, dict):
             return self._ensure_2d(cast(dict[str, torch.Tensor], raw_inputs.data))
         if hasattr(raw_inputs, "input_ids"):
             # Some tokenizers may return namespace-like objects
@@ -394,26 +399,6 @@ class TextChatModel(ChatModel):
             return None, stopper
         return StoppingCriteriaList(criteria), stopper
 
-    def _handle_oom(self, exc: BaseException) -> None:
-        """Handle CUDA OOM in a consistent, recoverable way.
-
-        Chat batching and API layers will interpret the re-raised exception as a
-        generic generation failure and surface a 500 error, while this helper
-        takes care of logging and best-effort cache cleanup.
-        """
-
-        logger.exception(
-            "chat_generate_oom",
-            extra={
-                "model": self.hf_repo_id,
-                "device": str(getattr(self.model, "device", "unknown")),
-            },
-        )
-        if torch.cuda.is_available():
-            with contextlib.suppress(Exception):
-                torch.cuda.empty_cache()
-        raise exc
-
     def _resolve_device_map(self, device_pref: str) -> str | None:
         if device_pref != "auto":
             return None
@@ -421,14 +406,3 @@ class TextChatModel(ChatModel):
             return "auto"
         logger.debug("accelerate not installed; loading %s without device_map", self.hf_repo_id)
         return None
-
-    def _resolve_runtime_device(self, preference: str) -> str:
-        pref = (preference or "auto").lower()
-        if pref != "auto":
-            return preference
-        backends = getattr(torch, "backends", None)
-        if getattr(torch.cuda, "is_available", lambda: False)():
-            return "cuda"
-        if backends and getattr(backends, "mps", None) and backends.mps.is_available():
-            return "mps"
-        return "cpu"

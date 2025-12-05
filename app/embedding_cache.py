@@ -6,12 +6,27 @@ from collections.abc import Callable
 from typing import cast
 
 import numpy as np
+import xxhash
 
 from app.monitoring.metrics import record_cache_usage
 
 
+def _hash_key(text: str) -> str:
+    """Compute a fast hash of the text for cache keying.
+
+    Using xxhash.xxh64 provides:
+    - Extremely fast hashing (faster than MD5/SHA by 10-50x)
+    - Fixed-size keys (16 hex chars) reducing memory for long inputs
+    - Very low collision probability for typical text lengths
+    """
+    return xxhash.xxh64(text.encode("utf-8")).hexdigest()
+
+
 class EmbeddingCache:
-    """Thread-safe LRU cache for embedding vectors keyed by input text."""
+    """Thread-safe LRU cache for embedding vectors keyed by input text.
+
+    Internally uses xxhash for fast, fixed-size cache keys.
+    """
 
     def __init__(self, max_size: int) -> None:
         self.max_size = max(0, max_size)
@@ -21,21 +36,23 @@ class EmbeddingCache:
     def get(self, text: str) -> np.ndarray | None:
         if self.max_size == 0:
             return None
+        key = _hash_key(text)
         with self._lock:
-            vec = self._store.get(text)
+            vec = self._store.get(key)
             if vec is None:
                 return None
             # Mark as recently used
-            self._store.move_to_end(text)
+            self._store.move_to_end(key)
             return vec
 
     def set(self, text: str, vector: np.ndarray) -> None:
         if self.max_size == 0:
             return
+        key = _hash_key(text)
         with self._lock:
-            if text in self._store:
-                self._store.move_to_end(text)
-            self._store[text] = vector
+            if key in self._store:
+                self._store.move_to_end(key)
+            self._store[key] = vector
             if len(self._store) > self.max_size:
                 # Evict least-recently-used item
                 self._store.popitem(last=False)

@@ -5,6 +5,7 @@ import io
 import logging
 import os
 import tempfile
+import threading
 import time
 import wave
 from collections.abc import Callable, Sequence
@@ -33,6 +34,8 @@ logger = logging.getLogger(__name__)
 type DeviceLike = torch.device | str | int | None
 type CudaDeviceLike = torch.device | str
 
+# Module-level state for warmup status, protected by _warmup_lock
+_warmup_lock = threading.Lock()
 _failed_models: set[str] = set()
 _capability_status: dict[str, dict[str, bool]] = {}
 
@@ -100,14 +103,8 @@ def _make_silence_wav(duration_sec: float = 0.2, sample_rate: int = 16000) -> st
         return tmp.name
 
 
-def warm_up_models(registry: ModelRegistry) -> list[str]:
-    """Warm each model (and each worker thread) to smooth first-request latency.
-
-    Runs one batch through every configured model on every executor worker to ensure
-    per-thread tokenizers are initialized and CUDA kernels are compiled.
-    Records failures instead of aborting startup so operations can inspect health data.
-    """
-
+def _build_warmup_config() -> tuple[WarmupConfig, set[str] | None, set[str] | None]:
+    """Build warmup configuration from environment variables."""
     batch_size = int(os.getenv("WARMUP_BATCH_SIZE", "1"))
     steps = int(os.getenv("WARMUP_STEPS", "1"))
     use_inference_mode = os.getenv("WARMUP_INFERENCE_MODE", "1") != "0"
@@ -124,8 +121,6 @@ def warm_up_models(registry: ModelRegistry) -> list[str]:
         "audio": get_audio_executor(),
     }
 
-    _failed_models.clear()
-    _capability_status.clear()
     config = WarmupConfig(
         batch_size=batch_size,
         steps=steps,
@@ -135,6 +130,61 @@ def warm_up_models(registry: ModelRegistry) -> list[str]:
         texts=texts,
         executors=executors,
     )
+    return config, allowlist, skiplist
+
+
+def _warmup_single_model(
+    name: str,
+    model: object,
+    config: WarmupConfig,
+) -> dict[str, bool]:
+    """Run warmup for a single model across all its capabilities."""
+    capabilities = getattr(model, "capabilities", [])
+    device = cast(DeviceLike, getattr(model, "device", None))
+    logger.info(
+        "warmup_plan",
+        extra={
+            "model": name,
+            "steps": config.steps,
+            "batch_size": config.batch_size,
+            "device": str(device),
+            "inference_mode": config.use_inference_mode,
+        },
+    )
+
+    capability_results: dict[str, bool] = {}
+    for capability in capabilities:
+        warmer = _CAPABILITY_WARMERS.get(capability)
+        if warmer is None:
+            logger.debug("warmup_noop", extra={"model": name, "capability": capability})
+            continue
+
+        ok = warmer(model, device, config)
+        capability_results[capability] = ok
+        executor = config.executors.get(capability)
+        log_extra: dict[str, str] = {"model": name, "capability": capability}
+        if executor is not None:
+            log_extra["executor"] = _executor_label(executor)
+        if ok:
+            logger.info("warmup_ok", extra=log_extra)
+        else:
+            logger.warning("warmup_failed", extra=log_extra)
+
+    return capability_results
+
+
+def warm_up_models(registry: ModelRegistry) -> list[str]:
+    """Warm each model (and each worker thread) to smooth first-request latency.
+
+    Runs one batch through every configured model on every executor worker to ensure
+    per-thread tokenizers are initialized and CUDA kernels are compiled.
+    Records failures instead of aborting startup so operations can inspect health data.
+    """
+    config, allowlist, skiplist = _build_warmup_config()
+
+    with _warmup_lock:
+        _failed_models.clear()
+        _capability_status.clear()
 
     for name in registry.list_models():
         if allowlist is not None and name not in allowlist:
@@ -145,45 +195,20 @@ def warm_up_models(registry: ModelRegistry) -> list[str]:
             continue
 
         model = registry.get(name)
-        capabilities = getattr(model, "capabilities", [])
-        device = cast(DeviceLike, getattr(model, "device", None))
-        plan = {
-            "model": name,
-            "steps": steps,
-            "batch_size": batch_size,
-            "device": str(device),
-            "inference_mode": use_inference_mode,
-        }
-        logger.info("warmup_plan", extra=plan)
+        capability_results = _warmup_single_model(name, model, config)
 
-        capability_results: dict[str, bool] = {}
-        for capability in capabilities:
-            warmer = _CAPABILITY_WARMERS.get(capability)
-            if warmer is None:
-                logger.debug("warmup_noop", extra={"model": name, "capability": capability})
-                continue
+        with _warmup_lock:
+            if capability_results:
+                _capability_status[name] = capability_results
+            if capability_results and not all(capability_results.values()):
+                _failed_models.add(name)
 
-            ok = warmer(model, device, config)
-            capability_results[capability] = ok
-            executor = config.executors.get(capability)
-            log_extra = {
-                "model": name,
-                "capability": capability,
-            }
-            if executor is not None:
-                log_extra["executor"] = _executor_label(executor)
-            if ok:
-                logger.info("warmup_ok", extra=log_extra)
-            else:
-                logger.warning("warmup_failed", extra=log_extra)
+    with _warmup_lock:
+        has_failures = bool(_failed_models)
+        failed_list = sorted(_failed_models) if has_failures else []
 
-        if capability_results:
-            _capability_status[name] = capability_results
-        if capability_results and not all(capability_results.values()):
-            _failed_models.add(name)
-
-    if _failed_models:
-        logger.warning("warmup_failed_models", extra={"models": sorted(_failed_models)})
+    if has_failures:
+        logger.warning("warmup_failed_models", extra={"models": failed_list})
     else:
         logger.info("warmup_completed")
 
@@ -577,8 +602,10 @@ _CAPABILITY_WARMERS: dict[str, WarmupFn] = {
 
 
 def get_failed_warmups() -> list[str]:
-    return sorted(_failed_models)
+    with _warmup_lock:
+        return sorted(_failed_models)
 
 
 def get_capability_status() -> dict[str, dict[str, bool]]:
-    return {model: caps.copy() for model, caps in _capability_status.items()}
+    with _warmup_lock:
+        return {model: caps.copy() for model, caps in _capability_status.items()}

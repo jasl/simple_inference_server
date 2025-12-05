@@ -151,8 +151,8 @@ All supported models are defined in `configs/model_config.yaml` (kept as the cat
 
 | id (`model` param) | HF repo | Handler |
 | --- | --- | --- |
-| `BAAI/bge-m3` | `BAAI/bge-m3` | `app.models.bge_m3.BgeM3Embedding` |
-| `google/embeddinggemma-300m` | `google/embeddinggemma-300m` | `app.models.embedding_gemma.EmbeddingGemmaEmbedding` |
+| `BAAI/bge-m3` | `BAAI/bge-m3` | `app.models.hf_embedding.HFEmbeddingModel` |
+| `google/embeddinggemma-300m` | `google/embeddinggemma-300m` | `app.models.hf_embedding.HFEmbeddingModel` |
 | `Qwen/Qwen3-VL-4B-Instruct-FP8` | `Qwen/Qwen3-VL-4B-Instruct-FP8` | `app.models.qwen_vl.QwenVLChat` |
 | `Qwen/Qwen3-VL-2B-Instruct-FP8` | `Qwen/Qwen3-VL-2B-Instruct-FP8` | `app.models.qwen_vl.QwenVLChat` |
 | `Qwen/Qwen3-VL-4B-Instruct` | `Qwen/Qwen3-VL-4B-Instruct` | `app.models.qwen_vl.QwenVLChat` |
@@ -325,7 +325,7 @@ All benchmark scripts accept environment overrides (e.g., `BASE_URL`, `MODEL_NAM
 
 ## Adding a new model
 
-1. **Implement a handler**: Create `app/models/<your_model>.py` implementing `EmbeddingModel` (see `bge_m3.py` / `embedding_gemma.py` for reference). Set `capabilities` on the handler (e.g., `["text-embedding"]`). Use `cache_dir` pointing to `models/` (or `HF_HOME` fallback) and `local_files_only=True`.
+1. **Implement a handler**: Create `app/models/<your_model>.py` implementing `EmbeddingModel` (see `hf_embedding.py` for reference). Set `capabilities` on the handler (e.g., `["text-embedding"]`). Use `cache_dir` pointing to `models/` (or `HF_HOME` fallback) and `local_files_only=True`.
 2. **Add config entry**: Append to `configs/model_config.yaml` with fields `name`, `hf_repo_id`, and `handler` (fully qualified import path, e.g., `app.models.my_model.MyModelEmbedding`). Keep all supported models in this file; it serves as the catalog.
 3. **Select models to load at runtime**: Set `MODELS` (comma-separated) or pass `--models` to `scripts/run_dev.py`. This is required; the server will exit if not provided.
 4. **Pre-download weights**: Run `uv run python scripts/download_models.py` (requires `MODELS` set) to populate `models/`, then rebuild/restart the service. The download script honors `MODELS` to fetch only selected models. Startup will fail if any requested model cannot be loaded.

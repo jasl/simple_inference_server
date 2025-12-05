@@ -73,11 +73,12 @@ def test_text_chat_generate_prepared_oom(monkeypatch: pytest.MonkeyPatch, mock_t
 
     calls: list[BaseException] = []
 
-    def fake_handle(exc: BaseException) -> None:
+    def fake_handle(exc: BaseException, model_name: str, device: Any) -> None:
         calls.append(exc)
         raise exc
 
-    obj._handle_oom = fake_handle
+    # Patch the shared handle_oom function imported in text_chat module
+    monkeypatch.setattr(text_chat, "handle_oom", fake_handle)
 
     with pytest.raises(_OOM):
         obj.generate_prepared(
@@ -116,11 +117,12 @@ def test_qwen_vl_generate_prepared_oom(monkeypatch: pytest.MonkeyPatch, mock_tor
 
     calls: list[BaseException] = []
 
-    def fake_handle(exc: BaseException) -> None:
+    def fake_handle(exc: BaseException, model_name: str, device: Any) -> None:
         calls.append(exc)
         raise exc
 
-    obj._handle_oom = fake_handle
+    # Patch the shared handle_oom function imported in qwen_vl module
+    monkeypatch.setattr(qwen_vl, "handle_oom", fake_handle)
 
     with pytest.raises(_OOM):
         obj.generate_prepared(
@@ -133,5 +135,3 @@ def test_qwen_vl_generate_prepared_oom(monkeypatch: pytest.MonkeyPatch, mock_tor
         )
 
     assert len(calls) == 1
-
-

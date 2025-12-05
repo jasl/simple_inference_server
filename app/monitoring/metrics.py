@@ -82,6 +82,12 @@ CHAT_BATCH_REQUEUES = Counter(
     labelnames=("model",),
 )
 
+CHAT_BATCH_DEGRADED_MAX_SIZE = Gauge(
+    "chat_batch_degraded_max_size",
+    "Current effective max batch size (may be reduced due to OOM)",
+    labelnames=("model",),
+)
+
 CHAT_COUNT_POOL_SIZE = Gauge(
     "chat_count_pool_size",
     "Worker count of the chat token counting executor",
@@ -203,6 +209,11 @@ def record_chat_batch_queue_rejection(model: str) -> None:
 def record_chat_batch_requeue(model: str) -> None:
     with suppress(Exception):
         CHAT_BATCH_REQUEUES.labels(model=model).inc()
+
+
+def record_chat_batch_degraded_max_size(model: str, size: int) -> None:
+    with suppress(Exception):
+        CHAT_BATCH_DEGRADED_MAX_SIZE.labels(model=model).set(size)
 
 
 def record_chat_count_pool_size(workers: int) -> None:

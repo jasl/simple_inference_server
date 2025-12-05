@@ -963,6 +963,171 @@ async def create_chat_completions(  # noqa: PLR0912
 ALLOWED_AUDIO_RESPONSE_FORMATS = {"json", "text", "srt", "verbose_json", "vtt"}
 
 
+def _validate_audio_params(
+    response_format: str,
+    timestamp_granularities: list[str] | None,
+    temperature: float | None,
+) -> tuple[float, Literal["word", "segment", None], bool]:
+    """Validate and resolve audio request parameters.
+
+    Returns:
+        tuple of (effective_temperature, granularity, need_segments)
+
+    Raises:
+        HTTPException if response_format is invalid.
+    """
+    if response_format not in ALLOWED_AUDIO_RESPONSE_FORMATS:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"Invalid response_format '{response_format}'",
+        )
+
+    # Whisper is deterministic with temperature=0; default to that unless user overrides.
+    effective_temperature = 0.0 if temperature is None else temperature
+    granularity = _select_granularity(timestamp_granularities)
+    need_segments = response_format in {"verbose_json", "srt", "vtt"} or granularity is not None
+
+    return effective_temperature, granularity, need_segments
+
+
+def _format_audio_response(
+    *,
+    response_format: str,
+    result: Any,
+    language: str | None,
+    duration: float | None,
+) -> Response:
+    """Build the appropriate Response based on response_format.
+
+    Args:
+        response_format: One of json, text, srt, verbose_json, vtt
+        result: SpeechResult from the model
+        language: Requested or detected language
+        duration: Audio duration in seconds
+    """
+    text = getattr(result, "text", "") or ""
+    language_out = getattr(result, "language", None) or language
+    duration_out = getattr(result, "duration", None) or duration
+    segments = getattr(result, "segments", None) or []
+
+    if response_format == "text":
+        return PlainTextResponse(text)
+
+    if response_format == "json":
+        return JSONResponse({"text": text})
+
+    if response_format == "verbose_json":
+        verbose = TranscriptionVerboseResponse(
+            text=text,
+            language=language_out,
+            duration=duration_out,
+            segments=[
+                TranscriptionSegment(id=s.id, start=s.start, end=s.end, text=s.text)
+                for s in segments
+            ]
+            if segments
+            else None,
+        )
+        return JSONResponse(verbose.model_dump(mode="json", exclude_none=True))
+
+    seg_dicts: list[dict[str, float | str]] = [
+        {"id": s.id, "start": s.start, "end": s.end, "text": s.text} for s in segments
+    ]
+    if not seg_dicts:
+        seg_dicts = [{"id": 0, "start": 0.0, "end": duration_out or 0.0, "text": text}]
+
+    if response_format == "srt":
+        return PlainTextResponse(_srt_from_segments(seg_dicts), media_type="application/x-subrip")
+
+    if response_format == "vtt":
+        return PlainTextResponse(_vtt_from_segments(seg_dicts), media_type="text/vtt")
+
+    # Should never reach here because of earlier validation
+    return JSONResponse({"text": text})
+
+
+async def _execute_transcription(  # noqa: PLR0913
+    *,
+    temp_path: str,
+    model: Any,
+    model_name: str,
+    request: Request,
+    task: Literal["transcribe", "translate"],
+    language: str | None,
+    prompt: str | None,
+    effective_temperature: float,
+    granularity: Literal["word", "segment", None],
+    need_segments: bool,
+    cancel_event: threading.Event,
+    audio_timeout: float,
+) -> Any:
+    """Execute the transcription/translation via the model.
+
+    Handles timeout, cancellation, and client disconnect.
+
+    Returns:
+        SpeechResult from the model
+
+    Raises:
+        HTTPException on timeout, cancellation, disconnect, or internal errors.
+    """
+    loop = asyncio.get_running_loop()
+    executor = get_audio_executor()
+
+    work_task: asyncio.Future[Any] = asyncio.ensure_future(
+        loop.run_in_executor(
+            executor,
+            lambda: model.transcribe(
+                temp_path,
+                language=language,
+                prompt=prompt,
+                temperature=effective_temperature,
+                task=task,
+                timestamp_granularity=granularity if need_segments else None,
+                cancel_event=cancel_event,
+            ),
+        )
+    )
+    try:
+        return await _run_work_with_client_cancel(
+            request=request,
+            work_task=work_task,
+            cancel_event=cancel_event,
+            timeout=audio_timeout,
+        )
+    except _WorkTimeoutError as exc:
+        cancel_event.set()
+        record_audio_request(model_name, "504")
+        raise HTTPException(
+            status_code=status.HTTP_504_GATEWAY_TIMEOUT,
+            detail="Audio processing timed out",
+        ) from exc
+    except _RequestCancelledError as exc:
+        cancel_event.set()
+        record_audio_request(model_name, "499")
+        raise HTTPException(
+            status_code=status.HTTP_499_CLIENT_CLOSED_REQUEST,
+            detail="Request cancelled",
+        ) from exc
+    except _ClientDisconnectedError as exc:
+        cancel_event.set()
+        record_audio_request(model_name, "499")
+        raise HTTPException(
+            status_code=status.HTTP_499_CLIENT_CLOSED_REQUEST,
+            detail="Client disconnected",
+        ) from exc
+    except Exception as exc:  # pragma: no cover - runtime failure
+        record_audio_request(model_name, "500")
+        logger.exception(
+            "audio_transcription_failed",
+            extra={"model": model_name, "task": task, "status": 500},
+        )
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Audio processing failed",
+        ) from exc
+
+
 def _resolve_audio_model_and_caps(registry: ModelRegistry, model_name: str) -> Any:
     """Lookup and validate an audio-capable model for Whisper-style endpoints."""
 
@@ -1020,7 +1185,7 @@ def _resolve_chat_model_and_caps(
     return model
 
 
-async def _handle_audio_request(  # noqa: PLR0912, PLR0913, PLR0915
+async def _handle_audio_request(  # noqa: PLR0913
     *,
     file: UploadFile,
     model_name: str,
@@ -1033,16 +1198,13 @@ async def _handle_audio_request(  # noqa: PLR0912, PLR0913, PLR0915
     temperature: float | None,
     timestamp_granularities: list[str] | None,
 ) -> Response:
-    if response_format not in ALLOWED_AUDIO_RESPONSE_FORMATS:
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail=f"Invalid response_format '{response_format}'",
-        )
+    """Process audio transcription/translation requests.
 
-    # Whisper is deterministic with temperature=0; default to that unless user overrides.
-    effective_temperature = 0.0 if temperature is None else temperature
-    granularity = _select_granularity(timestamp_granularities)
-    need_segments = response_format in {"verbose_json", "srt", "vtt"} or granularity is not None
+    Orchestrates parameter validation, file upload, model execution, and response formatting.
+    """
+    effective_temperature, granularity, need_segments = _validate_audio_params(
+        response_format, timestamp_granularities, temperature
+    )
 
     start = time.perf_counter()
     temp_path: str | None = None
@@ -1059,58 +1221,21 @@ async def _handle_audio_request(  # noqa: PLR0912, PLR0913, PLR0915
             executor = get_audio_executor()
             duration = await loop.run_in_executor(executor, lambda: _probe_duration(temp_path))
             model = _resolve_audio_model_and_caps(registry, model_name)
-            try:
-                work_task: asyncio.Future[Any] = asyncio.ensure_future(
-                    loop.run_in_executor(
-                        executor,
-                        lambda: model.transcribe(
-                            temp_path,
-                            language=language,
-                            prompt=prompt,
-                            temperature=effective_temperature,
-                            task=task,
-                            timestamp_granularity=granularity if need_segments else None,
-                            cancel_event=cancel_event,
-                        ),
-                    )
-                )
-                result = await _run_work_with_client_cancel(
-                    request=request,
-                    work_task=work_task,
-                    cancel_event=cancel_event,
-                    timeout=audio_timeout,
-                )
-            except _WorkTimeoutError as exc:
-                cancel_event.set()
-                record_audio_request(model_name, "504")
-                raise HTTPException(
-                    status_code=status.HTTP_504_GATEWAY_TIMEOUT,
-                    detail="Audio processing timed out",
-                ) from exc
-            except _RequestCancelledError as exc:
-                cancel_event.set()
-                record_audio_request(model_name, "499")
-                raise HTTPException(
-                    status_code=status.HTTP_499_CLIENT_CLOSED_REQUEST,
-                    detail="Request cancelled",
-                ) from exc
-            except _ClientDisconnectedError as exc:
-                cancel_event.set()
-                record_audio_request(model_name, "499")
-                raise HTTPException(
-                    status_code=status.HTTP_499_CLIENT_CLOSED_REQUEST,
-                    detail="Client disconnected",
-                ) from exc
-            except Exception as exc:  # pragma: no cover - runtime failure
-                record_audio_request(model_name, "500")
-                logger.exception(
-                    "audio_transcription_failed",
-                    extra={"model": model_name, "task": task, "status": 500},
-                )
-                raise HTTPException(
-                    status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-                    detail="Audio processing failed",
-                ) from exc
+
+            result = await _execute_transcription(
+                temp_path=temp_path,
+                model=model,
+                model_name=model_name,
+                request=request,
+                task=task,
+                language=language,
+                prompt=prompt,
+                effective_temperature=effective_temperature,
+                granularity=granularity,
+                need_segments=need_segments,
+                cancel_event=cancel_event,
+                audio_timeout=audio_timeout,
+            )
     except AudioQueueFullError as exc:
         record_audio_request(model_name, "429")
         raise HTTPException(
@@ -1152,46 +1277,12 @@ async def _handle_audio_request(  # noqa: PLR0912, PLR0913, PLR0915
         },
     )
 
-    # Build response content
-    text = getattr(result, "text", "") or ""
-    language_out = getattr(result, "language", None) or language
-    duration_out = getattr(result, "duration", None) or duration
-    segments = getattr(result, "segments", None) or []
-
-    if response_format == "text":
-        return PlainTextResponse(text)
-
-    if response_format == "json":
-        return JSONResponse({"text": text})
-
-    if response_format == "verbose_json":
-        verbose = TranscriptionVerboseResponse(
-            text=text,
-            language=language_out,
-            duration=duration_out,
-            segments=[
-                TranscriptionSegment(id=s.id, start=s.start, end=s.end, text=s.text)
-                for s in segments
-            ]
-            if segments
-            else None,
-        )
-        return JSONResponse(verbose.model_dump(mode="json", exclude_none=True))
-
-    seg_dicts: list[dict[str, float | str]] = [
-        {"id": s.id, "start": s.start, "end": s.end, "text": s.text} for s in segments
-    ]
-    if not seg_dicts:
-        seg_dicts = [{"id": 0, "start": 0.0, "end": duration_out or 0.0, "text": text}]
-
-    if response_format == "srt":
-        return PlainTextResponse(_srt_from_segments(seg_dicts), media_type="application/x-subrip")
-
-    if response_format == "vtt":
-        return PlainTextResponse(_vtt_from_segments(seg_dicts), media_type="text/vtt")
-
-    # Should never reach here because of earlier validation
-    return JSONResponse({"text": text})
+    return _format_audio_response(
+        response_format=response_format,
+        result=result,
+        language=language,
+        duration=duration,
+    )
 
 
 @router.post("/v1/audio/transcriptions")

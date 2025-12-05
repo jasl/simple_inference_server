@@ -1,15 +1,13 @@
 from __future__ import annotations
 
-import atexit
 import base64
-import contextlib
 import importlib
 import io
+import ipaddress
 import logging
 import os
-import threading
 import socket
-import ipaddress
+import threading
 import urllib.parse
 from collections.abc import Sequence
 from pathlib import Path
@@ -21,11 +19,15 @@ from PIL import Image
 from transformers import AutoProcessor, StoppingCriteria, StoppingCriteriaList
 
 from app.models.base import ChatGeneration, ChatModel
-from app.models.generation_utils import StopOnCancel, StopOnTokens, trim_with_stop
+from app.models.generation_utils import (
+    StopOnCancel,
+    StopOnTokens,
+    handle_oom,
+    resolve_runtime_device,
+    trim_with_stop,
+)
 
 logger = logging.getLogger(__name__)
-_HTTP_CLIENT: httpx.Client | None = None
-_HTTP_CLIENT_LOCK = threading.Lock()
 
 
 class QwenVLChat(ChatModel):
@@ -34,7 +36,7 @@ class QwenVLChat(ChatModel):
     def __init__(self, hf_repo_id: str, device: str = "auto") -> None:
         self.name = hf_repo_id
         self.capabilities = ["chat-completion", "vision"]
-        self.device = self._resolve_runtime_device(device)
+        self.device = resolve_runtime_device(device)
         self.hf_repo_id = hf_repo_id
         # Generation is serialized via _gen_lock so a single handler instance
         # is safe even when the shared chat executor has >1 workers.
@@ -71,6 +73,45 @@ class QwenVLChat(ChatModel):
             self.model.to(self.device)
         self.model.eval()
 
+        # HTTP client for remote image fetching, bound to instance lifecycle
+        self._http_client: httpx.Client | None = None
+        self._http_client_lock = threading.Lock()
+
+    def close(self) -> None:
+        """Close any resources held by this model instance."""
+        with self._http_client_lock:
+            if self._http_client is not None:
+                self._http_client.close()
+                self._http_client = None
+
+    def _get_http_client(self, *, timeout: float) -> httpx.Client:
+        """Return a lazily-created httpx client bound to this instance.
+
+        The client is created on first use and closed when the instance is closed.
+        Access is guarded by a lock to remain safe under multi-threaded callers.
+        """
+        if self._http_client is not None:
+            return self._http_client
+
+        with self._http_client_lock:
+            if self._http_client is None:
+                limits = httpx.Limits(max_keepalive_connections=8, max_connections=16)
+                self._http_client = httpx.Client(
+                    timeout=timeout,
+                    limits=limits,
+                    follow_redirects=True,
+                )
+                logger.info(
+                    "qwen_vl_http_client_created",
+                    extra={
+                        "model": self.hf_repo_id,
+                        "timeout": timeout,
+                        "max_keepalive_connections": limits.max_keepalive_connections,
+                        "max_connections": limits.max_connections,
+                    },
+                )
+            return self._http_client
+
     # ----------- Public API -------------------------------------------------
     def generate(
         self,
@@ -100,7 +141,7 @@ class QwenVLChat(ChatModel):
                 with torch.inference_mode():
                     output_ids = self.model.generate(**inputs, **generation_kwargs)
             except (torch.cuda.OutOfMemoryError, torch.OutOfMemoryError) as exc:
-                self._handle_oom(exc)
+                handle_oom(exc, self.hf_repo_id, getattr(self.model, "device", None))
 
             generated_ids = output_ids[:, prompt_len:]
             completion_tokens = int(generated_ids.shape[1])
@@ -147,7 +188,7 @@ class QwenVLChat(ChatModel):
                 with torch.inference_mode():
                     output_ids = self.model.generate(**inputs, **generation_kwargs)
             except (torch.cuda.OutOfMemoryError, torch.OutOfMemoryError) as exc:
-                self._handle_oom(exc)
+                handle_oom(exc, self.hf_repo_id, getattr(self.model, "device", None))
 
             generated_ids = output_ids[:, prompt_len:]
             completion_tokens = int(generated_ids.shape[1])
@@ -197,17 +238,6 @@ class QwenVLChat(ChatModel):
         if device_pref != "auto":
             return None
         return "auto"
-
-    def _resolve_runtime_device(self, preference: str) -> str:
-        pref = (preference or "auto").lower()
-        if pref != "auto":
-            return preference
-        backends = getattr(torch, "backends", None)
-        if getattr(torch.cuda, "is_available", lambda: False)():
-            return "cuda"
-        if backends and getattr(backends, "mps", None) and backends.mps.is_available():
-            return "mps"
-        return "cpu"
 
     def count_tokens(
         self, messages: Sequence[dict[str, Any]], *, add_generation_prompt: bool = True
@@ -291,21 +321,6 @@ class QwenVLChat(ChatModel):
             return None, stopper
         return StoppingCriteriaList(criteria), stopper
 
-    def _handle_oom(self, exc: BaseException) -> None:
-        """Handle CUDA OOM in a consistent, recoverable way."""
-
-        logger.exception(
-            "chat_generate_oom",
-            extra={
-                "model": self.hf_repo_id,
-                "device": str(getattr(self.model, "device", "unknown")),
-            },
-        )
-        if torch.cuda.is_available():
-            with contextlib.suppress(Exception):
-                torch.cuda.empty_cache()
-        raise exc
-
     def _normalize_chat_template_output(self, raw_inputs: Any) -> dict[str, torch.Tensor]:
         """Normalize processor outputs to a plain dict of tensors.
 
@@ -319,7 +334,7 @@ class QwenVLChat(ChatModel):
 
         if isinstance(raw_inputs, dict):
             source = raw_inputs
-        elif hasattr(raw_inputs, "data") and isinstance(getattr(raw_inputs, "data"), dict):
+        elif hasattr(raw_inputs, "data") and isinstance(raw_inputs.data, dict):
             source = raw_inputs.data  # BatchEncoding-style
         elif hasattr(raw_inputs, "input_ids"):
             source = {
@@ -415,7 +430,7 @@ class QwenVLChat(ChatModel):
                 raise ValueError("Remote image host not allowed")
             _reject_private_ip(parsed.hostname)
 
-            client = _get_http_client(timeout=remote_timeout)
+            client = self._get_http_client(timeout=remote_timeout)
 
             # HEAD for MIME/length validation
             head_resp = client.head(source, follow_redirects=True, timeout=remote_timeout)
@@ -448,37 +463,6 @@ class QwenVLChat(ChatModel):
         if not path.exists():
             raise FileNotFoundError(f"Image not found at path: {source}")
         return Image.open(path).convert("RGB")
-
-
-def _get_http_client(*, timeout: float) -> httpx.Client:
-    """Return a shared httpx client with connection pooling.
-
-    The client is created lazily and closed at process exit. Access is guarded by a
-    lock to remain safe under multi-threaded callers (e.g., chat thread pools).
-    """
-
-    global _HTTP_CLIENT
-    if _HTTP_CLIENT is not None:
-        return _HTTP_CLIENT
-
-    with _HTTP_CLIENT_LOCK:
-        if _HTTP_CLIENT is None:
-            limits = httpx.Limits(max_keepalive_connections=8, max_connections=16)
-            _HTTP_CLIENT = httpx.Client(
-                timeout=timeout,
-                limits=limits,
-                follow_redirects=True,
-            )
-            logger.info(
-                "qwen_vl_http_client_created",
-                extra={
-                    "timeout": timeout,
-                    "max_keepalive_connections": limits.max_keepalive_connections,
-                    "max_connections": limits.max_connections,
-                },
-            )
-            atexit.register(_HTTP_CLIENT.close)
-        return _HTTP_CLIENT
 
 
 def _reject_private_ip(host: str) -> None:

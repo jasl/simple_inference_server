@@ -1,12 +1,14 @@
 # Codebase assessment
 
-This document captures the current state of the codebase after enabling eager loading and broad warmup coverage. It highlights strengths, risks, and opportunities for further optimization.
+This document captures the current state of the codebase after the refactoring and optimization pass. It highlights strengths, design decisions, and important implementation details.
 
 ## What works well
 
-- **Startup contracts and fail-fast behavior**: The main startup path enforces model allowlisting, downloads when enabled, and validates dependencies like `ffmpeg`; optional warmup now fans out across all capabilities (embeddings, chat, vision) with per-worker execution and VRAM budgeting to avoid oversubscription.【F:app/main.py†L14-L91】【F:app/warmup.py†L98-L182】
-- **Backpressure and safety rails**: A bounded limiter couples `_queue` and a semaphore so requests either acquire capacity or receive clear 429/503-style errors without unbounded buffering; chat batching adds its own bounded queue and prompt-length guard before scheduling heavy work.【F:app/concurrency/limiter.py†L21-L97】【F:app/chat_batching.py†L47-L175】
-- **Batching and caching for high-frequency paths**: Embedding and chat handlers share configurable executors sized to `MAX_CONCURRENT`, leverage micro-batching with windowed coalescing, and embedder models include per-request no-grad guards plus an LRU cache to avoid redundant computation (see individual model implementations).【F:app/threadpool.py†L1-L46】【F:app/batching.py†L1-L180】
+- **Startup contracts and fail-fast behavior**: The main startup path enforces model allowlisting, downloads when enabled, and validates dependencies like `ffmpeg`; optional warmup now fans out across all capabilities (embeddings, chat, vision) with per-worker execution and VRAM budgeting to avoid oversubscription. Warmup module state is now thread-safe with explicit locking.【F:app/main.py†L14-L91】【F:app/warmup.py†L98-L182】
+- **Per-capability backpressure**: Dedicated limiters for embedding, chat, and audio traffic prevent one capability from starving another. Each limiter couples a bounded queue with a semaphore so requests either acquire capacity or receive clear 429/503-style errors without unbounded buffering; chat batching adds its own bounded queue and prompt-length guard before scheduling heavy work.【F:app/concurrency/limiter.py†L21-L97】【F:app/chat_batching.py†L47-L175】
+- **Batching and caching for high-frequency paths**: Embedding and chat handlers share configurable executors sized to `MAX_CONCURRENT`, leverage micro-batching with windowed coalescing, and embedder models include per-request no-grad guards plus an LRU cache (with fast xxhash keys) to avoid redundant computation.【F:app/threadpool.py†L1-L46】【F:app/batching.py†L1-L180】【F:app/embedding_cache.py†L1-L102】
+- **OOM graceful degradation**: Chat batching automatically halves the max batch size on OOM and recovers after a configurable cooldown (`CHAT_OOM_COOLDOWN_SEC`, default 5 minutes). This prevents cascading failures while allowing the service to self-heal.【F:app/chat_batching.py†L154-L190】
+- **Shared utilities**: Common logic for OOM handling and device resolution is extracted to `app/models/generation_utils.py`, ensuring consistent behavior across text and vision chat models.【F:app/models/generation_utils.py†L1-L60】
 
 ## Local dev: running tests and linters
 
@@ -24,10 +26,12 @@ Avoid calling `pytest`, `ruff`, or `mypy` directly without `uv run` to ensure th
 
 ## Engineering notes / conventions
 
-- When adding internal tasks that use `limiter` / `audio_limiter`, always set a queue label (model or task name) via `set_queue_label` / `set_audio_queue_label` so queue-wait metrics stay attributable instead of falling back to `generic`.
+- When adding internal tasks that use `embedding_limiter`, `chat_limiter`, or `audio_limiter`, always set a queue label (model or task name) via `set_queue_label` / `set_audio_queue_label` so queue-wait metrics stay attributable instead of falling back to `generic`.
 - Handler authors may expose a boolean `thread_safe` attribute; when `True` the handler is expected to be safe under up to `*_MAX_WORKERS` concurrent calls from the shared executor for that capability, without extra locking at the call site. When `False` the handler must serialize internal shared state (tokenizers, pipelines, HTTP clients) with its own locks; the server will still use the shared executor but will emit warnings if the corresponding worker count is >1 so operators know concurrency is effectively 1.
+- **HTTP client lifecycle**: Vision model handlers (e.g., `QwenVLChat`) manage their own `httpx.Client` instance bound to the model lifecycle rather than using a module-level global. This prevents connection leaks in hot-reload or testing scenarios and allows clean resource cleanup.
 - **Requeue path on chat batching**: When batching splits by generation parameters, leftover items are now requeued with bounded exponential backoff and a per-item deadline. This smooths burstiness without unbounded retries; items that cannot be requeued in time surface as 429s and are counted via `CHAT_BATCH_REQUEUES` / `CHAT_BATCH_QUEUE_REJECTIONS` metrics.【F:app/chat_batching.py†L171-L365】
 - **Visibility of warmup coverage**: Warmup metrics record pool readiness and `/health` exposes `warmup` details including per-model capability success plus `warmup_failures`. Operators can see which models/capabilities skipped or failed warmup without inspecting logs.【F:app/api.py†L1076-L1136】【F:app/warmup.py†L140-L185】
+- **Model handlers**: Embedding models can use `HFEmbeddingModel` directly from `app.models.hf_embedding`; custom embedding handlers should inherit from this class or implement the `EmbeddingModel` protocol. The empty shell classes `BgeM3Embedding` and `EmbeddingGemmaEmbedding` have been removed in favor of direct handler references in `model_config.yaml`.
 
 ## Future-facing structure: lightweight pools and protocols
 
