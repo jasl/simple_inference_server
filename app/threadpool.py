@@ -38,6 +38,30 @@ def _get_executor(kind: str, max_workers: int, thread_name_prefix: str) -> Threa
         return executor
 
 
+def enforce_single_worker(kind: str) -> int:
+    """Force a given executor kind to a single worker.
+
+    Returns the previous configured max_workers to aid logging.
+    """
+
+    kind_normalized = kind.strip().lower()
+    max_attr = f"{kind_normalized.upper()}_MAX_WORKERS"
+    state_key = f"{kind_normalized}_executor"
+    if max_attr not in globals() or state_key not in _state:
+        raise ValueError(f"Unknown executor kind: {kind}")
+
+    with _state_lock:
+        previous = int(globals().get(max_attr, 1))
+        globals()[max_attr] = 1
+        executor = _state.get(state_key)
+        _state[state_key] = None
+
+    if executor is not None:
+        executor.shutdown(wait=True)
+
+    return previous
+
+
 def get_embedding_executor() -> ThreadPoolExecutor:
     return _get_executor("embedding_executor", EMBEDDING_MAX_WORKERS, "embed-worker")
 

@@ -39,6 +39,7 @@ _PREPARE_TIMEOUT_SEC = float(os.getenv("CHAT_PREPARE_TIMEOUT_SEC", "10"))
 _GENERATE_TIMEOUT_SEC = float(os.getenv("CHAT_GENERATE_TIMEOUT_SEC", "60"))
 _OOM_COOLDOWN_SEC = float(os.getenv("CHAT_OOM_COOLDOWN_SEC", "300"))  # 5 minutes default
 _EXECUTOR_GRACE_PERIOD_SEC = float(os.getenv("EXECUTOR_GRACE_PERIOD_SEC", "2.0"))
+_CANCELLED_SENTINEL = object()
 
 
 @dataclass
@@ -86,7 +87,8 @@ class ChatBatcher:
         self._start_lock: asyncio.Lock | None = None
         self._stopping = False
         self.oom_retries = 0
-        self._requeue_tasks: set[asyncio.Task[None]] = set()
+        self._requeue_tasks: dict[asyncio.Task[None], _ChatBatchItem] = {}
+        self._pending_requeue_cleanup = False
         # OOM graceful degradation state
         self._current_max_batch = max_batch
         self._oom_cooldown_until: float | None = None
@@ -201,12 +203,54 @@ class ChatBatcher:
             },
         )
         record_chat_batch_degraded_max_size(self.model_name, self._current_max_batch)
+        self._pending_requeue_cleanup = True
+
+    def _prune_requeue_tasks(self, now: float, *, reason: str) -> None:
+        """Cancel stale requeue attempts to avoid unbounded growth."""
+
+        expired: list[tuple[asyncio.Task[None], _ChatBatchItem]] = []
+        done: list[asyncio.Task[None]] = []
+
+        for task, item in list(self._requeue_tasks.items()):
+            if task.done():
+                done.append(task)
+                continue
+
+            if item.deadline is not None and now >= item.deadline:
+                expired.append((task, item))
+
+        for task in done:
+            self._requeue_tasks.pop(task, None)
+
+        for task, item in expired:
+            task.cancel()
+            self._requeue_tasks.pop(task, None)
+            if not item.future.done():
+                item.future.set_exception(ChatBatchQueueTimeoutError("Chat batch requeue wait exceeded"))
+            item.cancel_event.set()
+            record_chat_batch_queue_rejection(self.model_name)
+            logger.warning(
+                "chat_batch_requeue_pruned",
+                extra={
+                    "model": self.model_name,
+                    "queue_size": self.queue.qsize(),
+                    "reason": reason,
+                    "requeue_tasks": len(self._requeue_tasks),
+                    "waited_sec": now - item.enqueue_time,
+                },
+            )
 
     async def _worker(self) -> None:  # noqa: PLR0912, PLR0915 - batching loop keeps several branches for fairness/backpressure
         loop = asyncio.get_running_loop()
         executor = get_chat_executor()
         try:
             while True:
+                prune_reason = "worker_loop"
+                if self._pending_requeue_cleanup:
+                    prune_reason = "oom"
+                    self._pending_requeue_cleanup = False
+                self._prune_requeue_tasks(loop.time(), reason=prune_reason)
+
                 first = await self.queue.get()
                 # Check OOM recovery before processing new batch
                 self._check_oom_recovery()
@@ -248,6 +292,7 @@ class ChatBatcher:
                                 bi.future.set_exception(
                                     ChatBatchQueueTimeoutError("Chat batch queue wait exceeded")
                                 )
+                            bi.cancel_event.set()
                             record_chat_batch_queue_rejection(self.model_name)
                         else:
                             alive_items.append(bi)
@@ -293,6 +338,10 @@ class ChatBatcher:
                     continue
 
                 for bi, gen in zip(batch_items, results, strict=False):
+                    if gen is _CANCELLED_SENTINEL:
+                        if not bi.future.done():
+                            bi.future.set_exception(asyncio.CancelledError())
+                        continue
                     if not bi.future.done():
                         bi.future.set_result(gen)
         except asyncio.CancelledError:
@@ -301,6 +350,7 @@ class ChatBatcher:
                 pending = self.queue.get_nowait()
                 if not pending.future.done():
                     pending.future.set_exception(asyncio.CancelledError())
+                pending.cancel_event.set()
             raise
 
     # --- helpers ------------------------------------------------------------
@@ -339,10 +389,15 @@ class ChatBatcher:
 
             # Fallback: run sequentially (still reduces queue contention and keeps
             # behaviour consistent with non-batched paths).
-            return [
-                self._generate_single(bi, stop_list, max_new_tokens, temperature, top_p)
-                for bi in batch_items
-            ]
+            outputs: list[Any] = []
+            for bi in batch_items:
+                if bi.cancel_event.is_set():
+                    outputs.append(_CANCELLED_SENTINEL)
+                    continue
+                outputs.append(
+                    self._generate_single(bi, stop_list, max_new_tokens, temperature, top_p)
+                )
+            return outputs
         except (torch.cuda.OutOfMemoryError, torch.OutOfMemoryError):  # pragma: no cover - OOM guard
             self.oom_retries += 1
             record_chat_batch_oom_retry(self.model_name)
@@ -392,6 +447,7 @@ class ChatBatcher:
         if item.deadline is not None and asyncio.get_running_loop().time() >= item.deadline:
             if not item.future.done():
                 item.future.set_exception(ChatBatchQueueTimeoutError("Chat batch queue deadline exceeded"))
+            item.cancel_event.set()
             record_chat_batch_queue_rejection(self.model_name)
             logger.warning(
                 "chat_batch_requeue_deadline_exceeded",
@@ -415,6 +471,7 @@ class ChatBatcher:
         if len(self._requeue_tasks) >= _REQUEUE_MAX_TASKS:
             if not item.future.done():
                 item.future.set_exception(ChatBatchQueueTimeoutError("Chat batch requeue backlog exceeded"))
+            item.cancel_event.set()
             record_chat_batch_queue_rejection(self.model_name)
             logger.warning(
                 "chat_batch_requeue_backlog_exceeded",
@@ -451,6 +508,7 @@ class ChatBatcher:
 
             if not item.future.done():
                 item.future.set_exception(ChatBatchQueueTimeoutError("Chat batch queue full"))
+            item.cancel_event.set()
             record_chat_batch_queue_rejection(self.model_name)
             logger.warning(
                 "chat_batch_requeue_timeout",
@@ -465,10 +523,10 @@ class ChatBatcher:
             return
 
         task = asyncio.create_task(_retry())
-        self._requeue_tasks.add(task)
+        self._requeue_tasks[task] = item
 
         def _cleanup(_t: asyncio.Task[Any]) -> None:
-            self._requeue_tasks.discard(_t)
+            self._requeue_tasks.pop(_t, None)
 
         task.add_done_callback(_cleanup)
 
@@ -479,16 +537,18 @@ class ChatBatcher:
                 pending = self.queue.get_nowait()
                 if not pending.future.done():
                     pending.future.set_exception(asyncio.CancelledError())
+                pending.cancel_event.set()
             self._task.cancel()
             with contextlib.suppress(asyncio.CancelledError):
                 await self._task
         self._task = None
-        requeue_tasks = list(self._requeue_tasks)
-        for task in requeue_tasks:
+        requeue_tasks = list(self._requeue_tasks.items())
+        for task, item in requeue_tasks:
+            item.cancel_event.set()
             task.cancel()
         if requeue_tasks:
             with contextlib.suppress(Exception):
-                await asyncio.gather(*requeue_tasks, return_exceptions=True)
+                await asyncio.gather(*(task for task, _ in requeue_tasks), return_exceptions=True)
         self._requeue_tasks.clear()
 
 

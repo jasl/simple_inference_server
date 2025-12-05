@@ -1,6 +1,8 @@
 import os
 from contextlib import suppress
+from typing import Any, cast
 
+import torch
 from prometheus_client import Counter, Gauge, Histogram, make_asgi_app
 from starlette.applications import Starlette
 
@@ -175,6 +177,40 @@ def setup_metrics(app: Starlette) -> None:
     app.mount("/metrics", make_asgi_app())
 
 
+def record_device_memory(device: str | torch.device | None) -> None:
+    """Expose device memory for Prometheus scraping.
+
+    Only GPU/XPU devices are recorded to avoid noisy/irrelevant CPU metrics.
+    """
+
+    with suppress(Exception):
+        if device is None:
+            return
+
+        torch_device = torch.device(device)
+        if torch_device.type not in {"cuda", "xpu"}:
+            return
+
+        if torch_device.type == "cuda" and torch.cuda.is_available():
+            with torch.cuda.device(torch_device):
+                free, total = torch.cuda.mem_get_info()
+                allocated = torch.cuda.memory_allocated(torch_device)
+                reserved = torch.cuda.memory_reserved(torch_device)
+        elif torch_device.type == "xpu" and getattr(torch, "xpu", None) and torch.xpu.is_available():
+            xpu = cast(Any, torch.xpu)
+            with xpu.device(torch_device):
+                free, total = xpu.mem_get_info(torch_device)
+                allocated = xpu.memory_allocated(torch_device)
+                reserved = xpu.memory_reserved(torch_device)
+        else:
+            return
+
+        device_label = torch_device.__str__()
+        DEVICE_MEMORY_USED.labels(device=device_label, type=torch_device.type).set(allocated)
+        DEVICE_MEMORY_RESERVED.labels(device=device_label, type=torch_device.type).set(reserved)
+        DEVICE_MEMORY_TOTAL.labels(device=device_label, type=torch_device.type).set(total)
+
+
 def record_request(model: str, status: str) -> None:
     with suppress(Exception):
         REQUEST_COUNT.labels(model=model, status=status).inc()
@@ -311,4 +347,22 @@ AUDIO_GENERIC_LABEL_WARN = Counter(
 GENERIC_LABEL_WARN = Counter(
     "queue_generic_label_warn_total",
     "Limiter used generic label instead of model/task",
+)
+
+DEVICE_MEMORY_USED = Gauge(
+    "device_memory_used_bytes",
+    "Device memory currently allocated (GPU/XPU)",
+    labelnames=("device", "type"),
+)
+
+DEVICE_MEMORY_RESERVED = Gauge(
+    "device_memory_reserved_bytes",
+    "Device memory reserved by torch (GPU/XPU)",
+    labelnames=("device", "type"),
+)
+
+DEVICE_MEMORY_TOTAL = Gauge(
+    "device_memory_total_bytes",
+    "Total device memory (GPU/XPU)",
+    labelnames=("device", "type"),
 )

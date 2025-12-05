@@ -11,6 +11,7 @@ import torch
 import yaml
 
 from app.models.base import ChatModel, EmbeddingModel
+from app.monitoring.metrics import record_device_memory
 from app.utils.device import resolve_device
 
 logger = logging.getLogger(__name__)
@@ -29,6 +30,7 @@ class ModelRegistry:
         self.device = resolve_device(self.device_preference, validate=True)
         self.allowed_models = {m.strip() for m in allowed_models or [] if m.strip()} or None
         self._load_from_config(config_path)
+        record_device_memory(self.device)
 
     def _load_from_config(self, path: str) -> None:
         path_obj = Path(path)

@@ -27,13 +27,14 @@ from app.concurrency.limiter import start_accepting, stop_accepting, wait_for_dr
 from app.logging_config import setup_logging
 from app.middleware import RequestIDMiddleware
 from app.models.registry import ModelRegistry
-from app.monitoring.metrics import setup_metrics
+from app.monitoring.metrics import record_device_memory, setup_metrics
 from app.state import WarmupStatus
 from app.threadpool import (
     AUDIO_MAX_WORKERS,
     CHAT_MAX_WORKERS,
     EMBEDDING_MAX_WORKERS,
     VISION_MAX_WORKERS,
+    enforce_single_worker,
     get_audio_executor,
     get_chat_executor,
     get_embedding_count_executor,
@@ -207,6 +208,8 @@ def startup() -> tuple[ModelRegistry, BatchingService, ChatBatchingService]:
     state.warmup_status = warmup_status
     state.runtime_config = runtime_cfg
 
+    record_device_memory(registry.device)
+
     return registry, batching_service, chat_batching_service
 
 
@@ -254,23 +257,36 @@ def _warn_thread_unsafe_models(registry: ModelRegistry) -> None:
         caps = getattr(model, "capabilities", [])
         warn = False
         workers = None
+        executor_kind: str | None = None
         if "audio-transcription" in caps or "audio-translation" in caps:
             warn = AUDIO_MAX_WORKERS > 1
             workers = AUDIO_MAX_WORKERS
+            executor_kind = "audio"
         elif "vision" in caps:
             warn = VISION_MAX_WORKERS > 1
             workers = VISION_MAX_WORKERS
+            executor_kind = "vision"
         elif "chat-completion" in caps:
             warn = CHAT_MAX_WORKERS > 1
             workers = CHAT_MAX_WORKERS
+            executor_kind = "chat"
         elif "text-embedding" in caps:
             warn = EMBEDDING_MAX_WORKERS > 1
             workers = EMBEDDING_MAX_WORKERS
+            executor_kind = "embedding"
 
         if warn:
+            previous = workers
+            if executor_kind is not None:
+                previous = enforce_single_worker(executor_kind)
             logger.warning(
                 "thread_unsafe_model_with_multiple_workers",
-                extra={"model": name, "capabilities": caps, "workers": workers},
+                extra={
+                    "model": name,
+                    "capabilities": caps,
+                    "workers": previous,
+                    "forced_workers": 1,
+                },
             )
 
 
