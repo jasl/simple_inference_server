@@ -40,11 +40,14 @@ from app.concurrency.audio_limiter import (
     set_queue_label as set_audio_queue_label,
 )
 from app.concurrency.limiter import (
+    CHAT_QUEUE_TIMEOUT_SEC,
+    EMBEDDING_QUEUE_TIMEOUT_SEC,
     QUEUE_TIMEOUT_SEC,
     QueueFullError,
     QueueTimeoutError,
     ShuttingDownError,
-    limiter,
+    chat_limiter,
+    embedding_limiter,
     reset_queue_label,
     set_queue_label,
 )
@@ -204,6 +207,47 @@ def _normalize_stop(stop: str | list[str] | None) -> list[str] | None:
     return [s for s in stop if s]
 
 
+def _resolve_generation_params(
+    req: "ChatCompletionRequest",
+    model: Any,
+) -> tuple[int, float, float]:
+    """Resolve max_tokens, temperature, top_p from request and model defaults.
+
+    Returns (max_tokens, temperature, top_p).
+    """
+    defaults = getattr(model, "generation_defaults", {}) or {}
+    max_tokens_default = defaults.get("max_tokens") or int(os.getenv("MAX_NEW_TOKENS", "512"))
+    temperature_default = defaults.get("temperature", 0.7)
+    top_p_default = defaults.get("top_p", 0.9)
+
+    max_tokens = req.max_tokens or max_tokens_default
+    temperature = req.temperature if req.temperature is not None else temperature_default
+    top_p = req.top_p if req.top_p is not None else top_p_default
+
+    return max_tokens, temperature, top_p
+
+
+def _build_generation_kwargs(  # noqa: PLR0913
+    *,
+    max_tokens: int,
+    temperature: float,
+    top_p: float,
+    stop: list[str] | None,
+    cancel_event: threading.Event | None,
+    accepts_cancel: bool,
+) -> dict[str, Any]:
+    """Build kwargs dict for model.generate or model.generate_prepared."""
+    kwargs: dict[str, Any] = {
+        "max_new_tokens": max_tokens,
+        "temperature": temperature,
+        "top_p": top_p,
+        "stop": stop,
+    }
+    if accepts_cancel and cancel_event is not None:
+        kwargs["cancel_event"] = cancel_event
+    return kwargs
+
+
 async def _prepare_chat_request(
     model: Any,
     messages: list[dict[str, Any]],
@@ -256,20 +300,13 @@ async def _run_chat_generation(  # noqa: PLR0915
     """
 
     model = _resolve_chat_model_and_caps(registry, req.model, has_images=has_images)
+    max_tokens, temperature, top_p = _resolve_generation_params(req, model)
 
-    defaults = getattr(model, "generation_defaults", {}) or {}
-    max_tokens_default = defaults.get("max_tokens") or int(os.getenv("MAX_NEW_TOKENS", "512"))
-    temperature_default = defaults.get("temperature", 0.7)
-    top_p_default = defaults.get("top_p", 0.9)
-
-    max_tokens = req.max_tokens or max_tokens_default
     if max_tokens <= 0:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail="max_tokens must be positive",
         )
-    temperature = req.temperature if req.temperature is not None else temperature_default
-    top_p = req.top_p if req.top_p is not None else top_p_default
 
     loop = asyncio.get_running_loop()
     executor = get_chat_executor()
@@ -290,38 +327,30 @@ async def _run_chat_generation(  # noqa: PLR0915
 
     async def _run_generation() -> ChatGeneration:
         if prepared_inputs is not None and hasattr(model, "generate_prepared"):
-            kwargs = {
-                "max_new_tokens": max_tokens,
-                "temperature": temperature,
-                "top_p": top_p,
-                "stop": stop,
-            }
-            if generate_prepared_accepts_cancel:
-                kwargs["cancel_event"] = cancel_event
-
+            kwargs = _build_generation_kwargs(
+                max_tokens=max_tokens,
+                temperature=temperature,
+                top_p=top_p,
+                stop=stop,
+                cancel_event=cancel_event,
+                accepts_cancel=generate_prepared_accepts_cancel,
+            )
             return await loop.run_in_executor(
                 executor,
-                lambda: model.generate_prepared(
-                    prepared_inputs,
-                    **kwargs,
-                ),
+                lambda: model.generate_prepared(prepared_inputs, **kwargs),
             )
 
-        kwargs = {
-            "max_new_tokens": max_tokens,
-            "temperature": temperature,
-            "top_p": top_p,
-            "stop": stop,
-        }
-        if generate_accepts_cancel:
-            kwargs["cancel_event"] = cancel_event
-
+        kwargs = _build_generation_kwargs(
+            max_tokens=max_tokens,
+            temperature=temperature,
+            top_p=top_p,
+            stop=stop,
+            cancel_event=cancel_event,
+            accepts_cancel=generate_accepts_cancel,
+        )
         return await loop.run_in_executor(
             executor,
-            lambda: model.generate(
-                raw_messages,
-                **kwargs,
-            ),
+            lambda: model.generate(raw_messages, **kwargs),
         )
 
     async def _run_batched_or_fallback() -> ChatGeneration:
@@ -487,6 +516,37 @@ async def _cancel_on_disconnect(request: Request, event: threading.Event) -> Non
         return
 
 
+EXECUTOR_GRACE_PERIOD = float(os.getenv("EXECUTOR_GRACE_PERIOD_SEC", "2.0"))
+
+
+async def _await_executor_cleanup(
+    work_task: "asyncio.Future[Any]",
+    grace_period: float,
+    reason: str,
+) -> None:
+    """Wait briefly for executor work to finish after cancellation.
+
+    This prevents background work from piling up silently after timeouts or
+    disconnects. If work doesn't complete within the grace period, we log a
+    warning but don't block further.
+    """
+    if work_task.done():
+        return
+
+    try:
+        await asyncio.wait_for(asyncio.shield(work_task), timeout=grace_period)
+    except TimeoutError:
+        logger.warning(
+            "executor_work_overran_grace_period",
+            extra={
+                "reason": reason,
+                "grace_period_sec": grace_period,
+            },
+        )
+    except Exception:  # noqa: S110 - intentionally silencing; work completion is enough
+        pass
+
+
 async def _run_work_with_client_cancel(  # noqa: D401
     request: Request,
     work_task: "asyncio.Future[Any]",
@@ -499,6 +559,10 @@ async def _run_work_with_client_cancel(  # noqa: D401
     task against client disconnect and a hard timeout. It does not translate
     errors into HTTP responses so that callers can keep metrics and status code
     handling local to each endpoint.
+
+    After setting the cancel_event on timeout or disconnect, we wait briefly
+    (EXECUTOR_GRACE_PERIOD) for the executor work to finish and log if it
+    overruns. This prevents background work from piling up silently.
     """
 
     disconnect_task: asyncio.Task[None] = asyncio.create_task(
@@ -513,6 +577,7 @@ async def _run_work_with_client_cancel(  # noqa: D401
         if not done:
             cancel_event.set()
             work_task.cancel()
+            await _await_executor_cleanup(work_task, EXECUTOR_GRACE_PERIOD, "timeout")
             raise _WorkTimeoutError()
 
         if work_task in done:
@@ -525,6 +590,7 @@ async def _run_work_with_client_cancel(  # noqa: D401
         # Client disconnect task completed first.
         cancel_event.set()
         work_task.cancel()
+        await _await_executor_cleanup(work_task, EXECUTOR_GRACE_PERIOD, "client_disconnect")
         raise _ClientDisconnectedError()
     finally:
         disconnect_task.cancel()
@@ -749,7 +815,7 @@ async def create_embeddings(  # noqa: PLR0912
     cancel_event = threading.Event()
     label_token = set_queue_label(req.model or "embedding")
     try:
-        async with limiter():
+        async with embedding_limiter():
             vectors = await _run_embedding_generation(
                 registry=registry,
                 model_name=req.model,
@@ -762,8 +828,8 @@ async def create_embeddings(  # noqa: PLR0912
         record_request(req.model, "429")
         raise HTTPException(
             status_code=status.HTTP_429_TOO_MANY_REQUESTS,
-            detail="Request queue full",
-            headers={"Retry-After": str(int(QUEUE_TIMEOUT_SEC))},
+            detail="Embedding request queue full",
+            headers={"Retry-After": str(int(EMBEDDING_QUEUE_TIMEOUT_SEC))},
         ) from exc
     except ShuttingDownError as exc:
         record_request(req.model, "503")
@@ -775,8 +841,8 @@ async def create_embeddings(  # noqa: PLR0912
         record_request(req.model, "429")
         raise HTTPException(
             status_code=status.HTTP_429_TOO_MANY_REQUESTS,
-            detail="Timed out waiting for worker",
-            headers={"Retry-After": str(int(QUEUE_TIMEOUT_SEC))},
+            detail="Timed out waiting for embedding worker",
+            headers={"Retry-After": str(int(EMBEDDING_QUEUE_TIMEOUT_SEC))},
         ) from exc
     finally:
         reset_queue_label(label_token)
@@ -823,7 +889,7 @@ async def create_chat_completions(  # noqa: PLR0912
     start = time.perf_counter()
     label_token = set_queue_label(req.model or "chat")
     try:
-        async with limiter():
+        async with chat_limiter():
             raw_messages = [msg.model_dump(mode="python") for msg in req.messages]
             has_images = _contains_image_content(raw_messages)
             generation, prompt_tokens, max_tokens = await _run_chat_generation(
@@ -837,8 +903,8 @@ async def create_chat_completions(  # noqa: PLR0912
         record_chat_request(req.model, "429")
         raise HTTPException(
             status_code=status.HTTP_429_TOO_MANY_REQUESTS,
-            detail="Request queue full",
-            headers={"Retry-After": str(int(QUEUE_TIMEOUT_SEC))},
+            detail="Chat request queue full",
+            headers={"Retry-After": str(int(CHAT_QUEUE_TIMEOUT_SEC))},
         ) from exc
     except ShuttingDownError as exc:
         record_chat_request(req.model, "503")
@@ -850,8 +916,8 @@ async def create_chat_completions(  # noqa: PLR0912
         record_chat_request(req.model, "429")
         raise HTTPException(
             status_code=status.HTTP_429_TOO_MANY_REQUESTS,
-            detail="Timed out waiting for worker",
-            headers={"Retry-After": str(int(QUEUE_TIMEOUT_SEC))},
+            detail="Timed out waiting for chat worker",
+            headers={"Retry-After": str(int(CHAT_QUEUE_TIMEOUT_SEC))},
         ) from exc
     finally:
         reset_queue_label(label_token)

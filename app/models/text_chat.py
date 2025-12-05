@@ -344,11 +344,19 @@ class TextChatModel(ChatModel):
             fixed[key] = tensor
         return fixed
 
-    def count_tokens(self, messages: Sequence[dict[str, Any]]) -> int:
+    def count_tokens(
+        self, messages: Sequence[dict[str, Any]], *, add_generation_prompt: bool = True
+    ) -> int:
+        """Count tokens in a message sequence.
+
+        By default, includes the generation prompt to match what will actually
+        be sent to the model during generation. Set add_generation_prompt=False
+        for raw message counting.
+        """
         encoded = self.tokenizer.apply_chat_template(
             messages,
             tokenize=True,
-            add_generation_prompt=False,
+            add_generation_prompt=add_generation_prompt,
             return_tensors="pt",
         )
         return int(encoded["input_ids"].shape[1])

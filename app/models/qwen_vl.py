@@ -189,23 +189,14 @@ class QwenVLChat(ChatModel):
             )
         return cls
 
-    def _resolve_device_map(self, device_pref: str) -> str | dict[str, Any] | None:
-        """Use device_map='auto' only if accelerate is installed; otherwise fall back."""
+    def _resolve_device_map(self, device_pref: str) -> str | None:
+        """Return 'auto' for device_map when using auto device preference.
 
+        Accelerate is a hard dependency, so we don't need a fallback branch.
+        """
         if device_pref != "auto":
             return None
-
-        try:
-            importlib.import_module("accelerate")
-            return "auto"
-        except ImportError:
-            logger.warning(
-                "accelerate not installed; cannot use device_map='auto'. "
-                "Model will load on default device and then .to(%s). "
-                "Install accelerate to enable sharded/auto placement.",
-                device_pref,
-            )
-            return None
+        return "auto"
 
     def _resolve_runtime_device(self, preference: str) -> str:
         pref = (preference or "auto").lower()
@@ -218,12 +209,20 @@ class QwenVLChat(ChatModel):
             return "mps"
         return "cpu"
 
-    def count_tokens(self, messages: Sequence[dict[str, Any]]) -> int:
+    def count_tokens(
+        self, messages: Sequence[dict[str, Any]], *, add_generation_prompt: bool = True
+    ) -> int:
+        """Count tokens in a message sequence.
+
+        By default, includes the generation prompt to match what will actually
+        be sent to the model during generation. Set add_generation_prompt=False
+        for raw message counting.
+        """
         qwen_messages = self._to_qwen_messages(messages)
         encoded = self.processor.apply_chat_template(
             qwen_messages,
             tokenize=True,
-            add_generation_prompt=False,
+            add_generation_prompt=add_generation_prompt,
             return_tensors="pt",
         )
         return int(encoded["input_ids"].shape[1])
@@ -420,13 +419,16 @@ class QwenVLChat(ChatModel):
 
             # HEAD for MIME/length validation
             head_resp = client.head(source, follow_redirects=True, timeout=remote_timeout)
-            _ensure_public_url(head_resp.url)
-            content_length = int(head_resp.headers.get("content-length", "0") or 0)
-            if max_bytes and content_length and content_length > max_bytes:
-                raise ValueError("Remote image too large")
-            content_type = (head_resp.headers.get("content-type") or "").split(";")[0].lower()
-            if mime_allowlist and content_type and content_type not in mime_allowlist:
-                raise ValueError("Remote image MIME not allowed")
+            try:
+                _ensure_public_url(head_resp.url)
+                content_length = int(head_resp.headers.get("content-length", "0") or 0)
+                if max_bytes and content_length and content_length > max_bytes:
+                    raise ValueError("Remote image too large")
+                content_type = (head_resp.headers.get("content-type") or "").split(";")[0].lower()
+                if mime_allowlist and content_type and content_type not in mime_allowlist:
+                    raise ValueError("Remote image MIME not allowed")
+            finally:
+                head_resp.close()
 
             with client.stream("GET", source, follow_redirects=True, timeout=remote_timeout) as resp:
                 _ensure_public_url(resp.url)

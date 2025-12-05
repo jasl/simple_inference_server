@@ -123,16 +123,49 @@ class ModelBatcher:
                 await self._task
 
 
-def _merge_cancel_events(events: list[threading.Event]) -> threading.Event | None:
-    """Return a representative cancel event for the batch.
+class _AggregateCancel:
+    """Aggregate cancel signal that triggers when any source event is set.
 
-    Embedding cancellation is best-effort and primarily driven by client
-    disconnects. To avoid spawning background threads per batch, we simply
-    reuse the first non-null event when multiple are present.
+    This avoids spawning background threads per batch while still honoring
+    cancellations from any request in the batch. The model's cancel check
+    calls is_set() which polls all source events.
+    """
+
+    __slots__ = ("_events",)
+
+    def __init__(self, events: list[threading.Event]) -> None:
+        self._events = events
+
+    def is_set(self) -> bool:
+        return any(e.is_set() for e in self._events)
+
+    def set(self) -> None:
+        for e in self._events:
+            e.set()
+
+    def wait(self, timeout: float | None = None) -> bool:
+        # Simple polling fallback; not used in hot path but keeps interface compatible.
+        deadline = None if timeout is None else time.monotonic() + timeout
+        while True:
+            if self.is_set():
+                return True
+            if deadline is not None and time.monotonic() >= deadline:
+                return False
+            time.sleep(0.01)
+
+
+def _merge_cancel_events(events: list[threading.Event]) -> _AggregateCancel | threading.Event | None:
+    """Return an aggregate cancel signal for the batch.
+
+    When multiple requests are batched together, we need to detect if *any* of
+    them has been cancelled. This returns an _AggregateCancel wrapper that
+    polls all source events on is_set().
     """
     if not events:
         return None
-    return events[0]
+    if len(events) == 1:
+        return events[0]
+    return _AggregateCancel(events)
 
 
 class BatchingService:

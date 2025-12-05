@@ -45,10 +45,27 @@ class HFEmbeddingModel(EmbeddingModel):
         self.dim = self.model.config.hidden_size
 
     @torch.no_grad()
-    def _encode(self, texts: list[str]) -> np.ndarray:
+    def _encode(
+        self, texts: list[str], cancel_event: threading.Event | None = None
+    ) -> np.ndarray:
+        """Encode texts with cooperative cancellation between steps.
+
+        Checks cancel_event between tokenization, forward pass, and normalization
+        to allow early exit when a request is cancelled.
+        """
         tokenizer = self._get_tokenizer()
         batch = tokenizer(texts, padding=True, truncation=True, return_tensors="pt").to(self.device)
+
+        # Check after tokenization
+        if cancel_event is not None and cancel_event.is_set():
+            raise RuntimeError("Embedding cancelled")
+
         outputs = self.model(**batch)
+
+        # Check after forward pass
+        if cancel_event is not None and cancel_event.is_set():
+            raise RuntimeError("Embedding cancelled")
+
         last_hidden = outputs.last_hidden_state  # (B, T, H)
         attention_mask = batch["attention_mask"].unsqueeze(-1)  # (B, T, 1)
         masked = last_hidden * attention_mask
@@ -62,7 +79,13 @@ class HFEmbeddingModel(EmbeddingModel):
         if cancel_event is not None and cancel_event.is_set():
             raise RuntimeError("Embedding cancelled")
 
-        vectors = embed_with_cache(texts, self._encode, self._cache, self.name)
+        # Pass cancel_event to _encode for cooperative cancellation
+        vectors = embed_with_cache(
+            texts,
+            lambda t: self._encode(t, cancel_event=cancel_event),
+            self._cache,
+            self.name,
+        )
 
         if cancel_event is not None and cancel_event.is_set():
             raise RuntimeError("Embedding cancelled")

@@ -9,12 +9,11 @@ COPY pyproject.toml uv.lock* ./
 RUN /root/.local/bin/uv sync --frozen --python /usr/local/bin/python
 
 COPY . .
+# Models can be pre-mounted at /app/models or downloaded on first boot (AUTO_DOWNLOAD_MODELS=1)
 COPY models/ /app/models/
 
 ENV PYTHONUNBUFFERED=1 \
     PYTHONDONTWRITEBYTECODE=1 \
-    HF_HUB_OFFLINE=1 \
-    TRANSFORMERS_OFFLINE=1 \
     HF_HOME=/app/models
 
 CMD ["/root/.local/bin/uv", "run", "uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000"]

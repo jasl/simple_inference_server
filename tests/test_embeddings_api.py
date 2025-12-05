@@ -85,13 +85,13 @@ def test_invalid_encoding_format_returns_400() -> None:
 def test_queue_full_returns_429(monkeypatch: pytest.MonkeyPatch) -> None:
     client = TestClient(create_app())
 
-    # Force limiter to raise QueueFullError immediately
+    # Force embedding_limiter to raise QueueFullError immediately
     @asynccontextmanager
     async def fail_limiter() -> AsyncIterator[None]:
         raise QueueFullError
         yield
 
-    monkeypatch.setattr(api, "limiter", fail_limiter)
+    monkeypatch.setattr(api, "embedding_limiter", fail_limiter)
 
     resp = client.post("/v1/embeddings", json={"model": "dummy", "input": "x"})
     assert resp.status_code == HTTP_TOO_MANY
