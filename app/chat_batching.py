@@ -408,10 +408,15 @@ class ChatBatcher:
             if len(batch_items) == 1:
                 raise
             # Retry sequentially to reduce peak memory.
-            return [
-                self._generate_single(bi, stop_list, max_new_tokens, temperature, top_p)
-                for bi in batch_items
-            ]
+            oom_outputs: list[Any] = []
+            for bi in batch_items:
+                if bi.cancel_event.is_set():
+                    oom_outputs.append(_CANCELLED_SENTINEL)
+                    continue
+                oom_outputs.append(
+                    self._generate_single(bi, stop_list, max_new_tokens, temperature, top_p)
+                )
+            return oom_outputs
 
     def _generate_single(
         self,
