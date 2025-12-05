@@ -256,38 +256,32 @@ def _warn_thread_unsafe_models(registry: ModelRegistry) -> None:
 
         caps = getattr(model, "capabilities", [])
         warn = False
-        workers = None
         executor_kind: str | None = None
         if "audio-transcription" in caps or "audio-translation" in caps:
             warn = AUDIO_MAX_WORKERS > 1
-            workers = AUDIO_MAX_WORKERS
             executor_kind = "audio"
         elif "vision" in caps:
             warn = VISION_MAX_WORKERS > 1
-            workers = VISION_MAX_WORKERS
             executor_kind = "vision"
         elif "chat-completion" in caps:
             warn = CHAT_MAX_WORKERS > 1
-            workers = CHAT_MAX_WORKERS
             executor_kind = "chat"
         elif "text-embedding" in caps:
             warn = EMBEDDING_MAX_WORKERS > 1
-            workers = EMBEDDING_MAX_WORKERS
             executor_kind = "embedding"
 
-        if warn:
-            previous = workers
-            if executor_kind is not None:
-                previous = enforce_single_worker(executor_kind)
-            logger.warning(
-                "thread_unsafe_model_with_multiple_workers",
-                extra={
-                    "model": name,
-                    "capabilities": caps,
-                    "workers": previous,
-                    "forced_workers": 1,
-                },
-            )
+        if warn and executor_kind is not None:
+            previous = enforce_single_worker(executor_kind)
+            if previous > 1:
+                logger.warning(
+                    "thread_unsafe_model_with_multiple_workers",
+                    extra={
+                        "model": name,
+                        "capabilities": caps,
+                        "workers": previous,
+                        "forced_workers": 1,
+                    },
+                )
 
 
 
