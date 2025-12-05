@@ -81,6 +81,9 @@ class ChatBatcher:
         # Bounded queue to avoid unbounded RAM growth under slow/backlogged models.
         self.queue: asyncio.Queue[_ChatBatchItem] = asyncio.Queue(maxsize=max(queue_size, 1))
         self._task: asyncio.Task[None] | None = None
+        # Lazily created on first enqueue to bind to the running loop and avoid
+        # multiple workers being spawned under concurrent first use.
+        self._start_lock: asyncio.Lock | None = None
         self._stopping = False
         self.oom_retries = 0
         self._requeue_tasks: set[asyncio.Task[None]] = set()
@@ -126,7 +129,16 @@ class ChatBatcher:
             raise ValueError(f"Prompt too long; max {self.max_prompt_tokens} tokens")
 
         if self._task is None:
-            self._task = loop.create_task(self._worker(), name=f"chat-batcher-{getattr(self.model, 'name', 'model')}")
+            # Guard worker creation with a per-instance lock so concurrent first
+            # use does not accidentally start multiple batcher workers.
+            if self._start_lock is None:
+                self._start_lock = asyncio.Lock()
+            async with self._start_lock:
+                if self._task is None:
+                    self._task = loop.create_task(
+                        self._worker(),
+                        name=f"chat-batcher-{getattr(self.model, 'name', 'model')}",
+                    )
 
         fut: asyncio.Future[Any] = loop.create_future()
         item = _ChatBatchItem(

@@ -35,13 +35,22 @@ class ModelBatcher:
         # Bounded queue prevents unbounded memory growth under bursty load.
         self.queue: asyncio.Queue[_BatchItem] = asyncio.Queue(max(queue_size, 1))
         self._task: asyncio.Task[None] | None = None
+        # Lazily created on first enqueue to bind to the running loop and avoid
+        # multiple workers being spawned under concurrent first use.
+        self._start_lock: asyncio.Lock | None = None
         self.queue_timeout = max(queue_timeout, 0.0)
 
     async def enqueue(self, texts: list[str], cancel_event: threading.Event | None = None) -> np.ndarray:
         loop = asyncio.get_running_loop()
         if self._task is None:
             # Lazily start worker on first request to bind to the running loop.
-            self._task = loop.create_task(self._worker())
+            # Guarded by a per-instance lock so we do not accidentally spawn
+            # multiple workers under concurrent first use.
+            if self._start_lock is None:
+                self._start_lock = asyncio.Lock()
+            async with self._start_lock:
+                if self._task is None:
+                    self._task = loop.create_task(self._worker())
 
         fut: asyncio.Future[np.ndarray] = loop.create_future()
         try:
