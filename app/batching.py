@@ -101,6 +101,12 @@ class ModelBatcher:
             cancel_events = [bi.cancel_event for bi in active_items if bi.cancel_event is not None]
             cancel_event = _merge_cancel_events(cancel_events)
 
+            if cancel_event is not None and cancel_event.is_set():
+                for bi in active_items:
+                    if not bi.future.done():
+                        bi.future.set_exception(asyncio.CancelledError())
+                continue
+
             try:
                 vectors = await loop.run_in_executor(
                     executor,
@@ -127,6 +133,8 @@ class ModelBatcher:
                 pending = self.queue.get_nowait()
                 if not pending.future.done():
                     pending.future.set_exception(asyncio.CancelledError())
+                if pending.cancel_event is not None:
+                    pending.cancel_event.set()
             self._task.cancel()
             with contextlib.suppress(asyncio.CancelledError):
                 await self._task

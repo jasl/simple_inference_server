@@ -27,13 +27,14 @@ from app.concurrency.limiter import start_accepting, stop_accepting, wait_for_dr
 from app.logging_config import setup_logging
 from app.middleware import RequestIDMiddleware
 from app.models.registry import ModelRegistry
-from app.monitoring.metrics import setup_metrics
+from app.monitoring.metrics import record_device_memory, setup_metrics
 from app.state import WarmupStatus
 from app.threadpool import (
     AUDIO_MAX_WORKERS,
     CHAT_MAX_WORKERS,
     EMBEDDING_MAX_WORKERS,
     VISION_MAX_WORKERS,
+    enforce_single_worker,
     get_audio_executor,
     get_chat_executor,
     get_embedding_count_executor,
@@ -44,6 +45,15 @@ from app.threadpool import (
 from app.warmup import warm_up_models
 
 logger = logging.getLogger(__name__)
+
+# Mapping from capability to executor kind for thread-safety enforcement
+_CAPABILITY_EXECUTOR_MAP: dict[str, str] = {
+    "audio-transcription": "audio",
+    "audio-translation": "audio",
+    "vision": "vision",
+    "chat-completion": "chat",
+    "text-embedding": "embedding",
+}
 
 
 def _load_model_config() -> tuple[str, list[str] | None, str | None]:
@@ -141,7 +151,7 @@ def startup() -> tuple[ModelRegistry, BatchingService, ChatBatchingService]:
         logger.exception("Failed to load models during startup", extra={"config_path": config_path})
         raise SystemExit(1) from exc
 
-    _warn_thread_unsafe_models(registry)
+    _enforce_thread_safety(registry)
     _validate_ffmpeg_for_audio(registry)
 
     batching_service, chat_batching_service, batch_cfg = _init_batching(registry)
@@ -207,6 +217,8 @@ def startup() -> tuple[ModelRegistry, BatchingService, ChatBatchingService]:
     state.warmup_status = warmup_status
     state.runtime_config = runtime_cfg
 
+    record_device_memory(registry.device)
+
     return registry, batching_service, chat_batching_service
 
 
@@ -242,36 +254,35 @@ def _warn_if_accelerate_missing(config_path: str, allowlist: list[str] | None) -
             )
 
 
-def _warn_thread_unsafe_models(registry: ModelRegistry) -> None:
-    """Warn if non-thread-safe handlers are paired with worker>1 executors."""
+def _enforce_thread_safety(registry: ModelRegistry) -> None:
+    """Enforce single-worker executors for thread-unsafe models and log warnings."""
+    enforced_kinds: set[str] = set()
 
     for name in registry.list_models():
         model = registry.get(name)
-        thread_safe = getattr(model, "thread_safe", True)
-        if thread_safe:
+        if getattr(model, "thread_safe", True):
             continue
 
         caps = getattr(model, "capabilities", [])
-        warn = False
-        workers = None
-        if "audio-transcription" in caps or "audio-translation" in caps:
-            warn = AUDIO_MAX_WORKERS > 1
-            workers = AUDIO_MAX_WORKERS
-        elif "vision" in caps:
-            warn = VISION_MAX_WORKERS > 1
-            workers = VISION_MAX_WORKERS
-        elif "chat-completion" in caps:
-            warn = CHAT_MAX_WORKERS > 1
-            workers = CHAT_MAX_WORKERS
-        elif "text-embedding" in caps:
-            warn = EMBEDDING_MAX_WORKERS > 1
-            workers = EMBEDDING_MAX_WORKERS
+        for cap in caps:
+            executor_kind = _CAPABILITY_EXECUTOR_MAP.get(cap)
+            if executor_kind is None or executor_kind in enforced_kinds:
+                continue
 
-        if warn:
-            logger.warning(
-                "thread_unsafe_model_with_multiple_workers",
-                extra={"model": name, "capabilities": caps, "workers": workers},
-            )
+            previous = enforce_single_worker(executor_kind)
+            enforced_kinds.add(executor_kind)
+
+            if previous > 1:
+                logger.warning(
+                    "thread_unsafe_model_with_multiple_workers",
+                    extra={
+                        "model": name,
+                        "capability": cap,
+                        "executor": executor_kind,
+                        "workers": previous,
+                        "forced_workers": 1,
+                    },
+                )
 
 
 
