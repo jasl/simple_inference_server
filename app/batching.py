@@ -153,7 +153,7 @@ class BatchingService:
             os.getenv("EMBEDDING_BATCH_WINDOW_MS", "6")
         )
         self.queue_size = queue_size if queue_size is not None else int(
-            os.getenv("EMBEDDING_BATCH_QUEUE_SIZE", os.getenv("BATCH_QUEUE_SIZE", os.getenv("MAX_QUEUE_SIZE", "64")))
+            os.getenv("EMBEDDING_BATCH_QUEUE_SIZE", os.getenv("MAX_QUEUE_SIZE", "64"))
         )
         self.queue_timeout_sec = queue_timeout_sec if queue_timeout_sec is not None else float(
             os.getenv("EMBEDDING_BATCH_QUEUE_TIMEOUT_SEC", os.getenv("QUEUE_TIMEOUT_SEC", "2.0"))

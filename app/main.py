@@ -76,7 +76,7 @@ def startup() -> tuple[ModelRegistry, BatchingService, ChatBatchingService]:  # 
     batch_max_size = int(
         os.getenv("EMBEDDING_BATCH_WINDOW_MAX_SIZE", os.getenv("MAX_BATCH_SIZE", "32"))
     )
-    batch_queue_size = int(os.getenv("EMBEDDING_BATCH_QUEUE_SIZE", os.getenv("BATCH_QUEUE_SIZE", os.getenv("MAX_QUEUE_SIZE", "64"))))
+    batch_queue_size = int(os.getenv("EMBEDDING_BATCH_QUEUE_SIZE", os.getenv("MAX_QUEUE_SIZE", "64")))
     batching_service = BatchingService(
         registry,
         enabled=batching_enabled,
@@ -102,8 +102,7 @@ def startup() -> tuple[ModelRegistry, BatchingService, ChatBatchingService]:  # 
         allow_vision=chat_allow_vision,
     )
 
-    # Set both module-global and FastAPI state for robustness
-    state.model_registry = registry
+    # Record process-wide services for non-request contexts (e.g., warmup status).
     state.batching_service = batching_service
     state.chat_batching_service = chat_batching_service
 
@@ -386,7 +385,6 @@ async def shutdown(
     stop_accepting_audio()
     await wait_for_drain()
     await wait_for_drain_audio()
-    state.model_registry = None
     if batching_service is not None:
         await batching_service.stop()
         state.batching_service = None

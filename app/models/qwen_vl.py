@@ -17,13 +17,7 @@ from typing import Any
 import httpx
 import torch
 from PIL import Image
-from transformers import (
-    AutoModelForCausalLM,
-    AutoProcessor,
-    StoppingCriteria,
-    StoppingCriteriaList,
-    __version__ as TRANSFORMERS_VERSION,
-)
+from transformers import AutoProcessor, StoppingCriteria, StoppingCriteriaList
 
 from app.models.base import ChatGeneration, ChatModel
 
@@ -92,7 +86,6 @@ class QwenVLChat(ChatModel):
             local_files_only=True,
             cache_dir=self.cache_dir,
         )
-        # Qwen3-VL has a dedicated class in recent transformers; fall back to AutoModel when absent.
         model_cls: Any = self._resolve_model_cls()
         self.model = model_cls.from_pretrained(
             hf_repo_id,
@@ -198,23 +191,26 @@ class QwenVLChat(ChatModel):
 
     # ----------- Helpers ----------------------------------------------------
     def _resolve_model_cls(self) -> Any:
-        """Use dedicated Qwen3-VL class if available; otherwise fall back to AutoModel."""
+        """Resolve the dedicated Qwen3-VL class and fail hard if unavailable.
+
+        This removes the older fallback to AutoModelForCausalLM so that we only
+        ever run against the intended Qwen3-VL architecture. If the installed
+        transformers build does not expose Qwen3VLForConditionalGeneration,
+        startup should fail rather than silently degrading behaviour.
+        """
 
         try:
             module = importlib.import_module("transformers")
-            cls = getattr(module, "Qwen3VLForConditionalGeneration", None)
-            if cls is not None:
-                return cls
-        except Exception as exc:  # pragma: no cover - best-effort import
-            logger.debug("Failed to import Qwen3VLForConditionalGeneration: %s", exc)
-        # Warn only when we have to fall back; users on >=4.51.0 should have the class.
-        logger.warning(
-            "Qwen3VLForConditionalGeneration not found in transformers %s; "
-            "falling back to AutoModelForCausalLM with trust_remote_code. "
-            "Consider upgrading transformers to >=4.51.0 (pyproject pins 4.57.3).",
-            TRANSFORMERS_VERSION,
-        )
-        return AutoModelForCausalLM
+        except Exception as exc:  # pragma: no cover - defensive
+            raise ImportError("transformers is required for Qwen3-VL models") from exc
+
+        cls = getattr(module, "Qwen3VLForConditionalGeneration", None)
+        if cls is None:
+            raise ImportError(
+                "Qwen3VLForConditionalGeneration not found in the installed transformers package. "
+                "Upgrade transformers to a build that includes Qwen3-VL (pyproject pins 4.57.3)."
+            )
+        return cls
 
     def _resolve_device_map(self, device_pref: str) -> str | dict[str, Any] | None:
         """Use device_map='auto' only if accelerate is installed; otherwise fall back."""
