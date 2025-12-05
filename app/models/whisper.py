@@ -27,6 +27,7 @@ from app.monitoring.metrics import (
 
 from app.models.base import SpeechModel, SpeechResult, SpeechSegment
 from app.models.generation_utils import StopOnCancel
+from app.utils.device import resolve_torch_device
 
 logger = logging.getLogger(__name__)
 
@@ -38,7 +39,7 @@ class WhisperASR(SpeechModel):
         self.hf_repo_id = hf_repo_id
         self.name = hf_repo_id  # expose repo id for clarity in logs/metrics
         self.capabilities = ["audio-transcription", "audio-translation"]
-        self.device = self._resolve_device(device)
+        self.device = resolve_torch_device(device, validate=False)
         # Serialize access to the underlying pipeline so that a single handler
         # instance is safe even when the shared audio executor has >1 workers.
         self._lock = threading.Lock()
@@ -77,7 +78,7 @@ class WhisperASR(SpeechModel):
         # Optional hard-kill path: run transcribe inside a dedicated worker process.
         self._use_subprocess = os.getenv("WHISPER_USE_SUBPROCESS", "0") != "0"
         self._proc_ctx = mp.get_context("spawn") if self._use_subprocess else None
-        self._worker_proc: mp.Process | None = None
+        self._worker_proc: mp.process.BaseProcess | None = None
         self._parent_conn: mp.connection.Connection | None = None
         self._proc_lock = threading.Lock()
         self._last_used = time.monotonic()
@@ -183,16 +184,6 @@ class WhisperASR(SpeechModel):
             segments=segments or None,
         )
 
-    def _resolve_device(self, preference: str) -> torch.device:
-        pref = (preference or "auto").lower()
-        if pref == "auto":
-            if torch.cuda.is_available():
-                return torch.device("cuda")
-            if getattr(torch.backends, "mps", None) and torch.backends.mps.is_available():
-                return torch.device("mps")
-            return torch.device("cpu")
-        return torch.device(pref)
-
     def _pipeline_device_arg(self) -> int | str | torch.device:
         if self.device.type == "cpu":
             return -1
@@ -218,8 +209,11 @@ class WhisperASR(SpeechModel):
             except Exception:
                 pass
 
-        parent_conn, child_conn = self._proc_ctx.Pipe(duplex=True)  # type: ignore[arg-type]
-        proc = self._proc_ctx.Process(  # type: ignore[arg-type]
+        if self._proc_ctx is None:
+            raise RuntimeError("Subprocess mode not initialized")
+
+        parent_conn, child_conn = self._proc_ctx.Pipe(duplex=True)
+        proc = self._proc_ctx.Process(
             target=_worker_loop,
             args=(child_conn, self.hf_repo_id, self._device_str()),
             daemon=True,
@@ -233,8 +227,20 @@ class WhisperASR(SpeechModel):
     def _kill_worker(self, log_reason: str | None = None) -> None:
         if self._worker_proc is not None:
             with contextlib.suppress(Exception):
-                self._worker_proc.kill()
+                if self._parent_conn is not None:
+                    try:
+                        self._parent_conn.send({"cmd": "stop"})
+                    except Exception:
+                        pass
+                    try:
+                        self._parent_conn.close()
+                    except Exception:
+                        pass
             self._worker_proc.join(timeout=1.0)
+            if self._worker_proc.is_alive():
+                with contextlib.suppress(Exception):
+                    self._worker_proc.kill()
+                self._worker_proc.join(timeout=1.0)
             record_whisper_kill(self.hf_repo_id)
             if log_reason:
                 logging.getLogger(__name__).warning(
@@ -313,83 +319,3 @@ class WhisperASR(SpeechModel):
             super_close = getattr(self.pipeline, "close", None)
             if callable(super_close):
                 super_close()
-
-
-def _worker_loop(conn: mp.connection.Connection, hf_repo_id: str, device: str) -> None:
-    """Subprocess loop that owns Whisper pipeline and handles transcribe requests."""
-
-    try:
-        processor = WhisperProcessor.from_pretrained(
-            hf_repo_id,
-            local_files_only=True,
-            cache_dir=os.environ.get("HF_HOME"),
-        )
-        model = WhisperForConditionalGeneration.from_pretrained(
-            hf_repo_id,
-            local_files_only=True,
-            cache_dir=os.environ.get("HF_HOME"),
-        )
-        dev = torch.device(device)
-        if dev.type == "cuda":
-            model.to(dev)
-            model.half()
-        else:
-            model.to(dev)
-        model.eval()
-
-        pipe = pipeline(
-            task="automatic-speech-recognition",
-            model=model,
-            tokenizer=processor.tokenizer,
-            feature_extractor=processor.feature_extractor,
-            device=-1 if dev.type == "cpu" else dev,
-            torch_dtype=model.dtype,
-        )
-    except Exception as exc:  # pragma: no cover - defensive
-        conn.send({"err": f"init_failed: {exc}", "trace": traceback.format_exc()})
-        return
-
-    while True:
-        try:
-            msg = conn.recv()
-        except EOFError:
-            break
-
-        if not isinstance(msg, dict):
-            continue
-        if msg.get("cmd") == "stop":
-            break
-        if msg.get("cmd") != "transcribe":
-            continue
-
-        try:
-            generate_kwargs = {
-                "task": msg.get("task"),
-            }
-            if msg.get("language"):
-                generate_kwargs["language"] = msg.get("language")
-            if msg.get("prompt"):
-                try:
-                    prompt_ids = processor.get_prompt_ids(msg.get("prompt"), return_tensors="pt")
-                    generate_kwargs["prompt_ids"] = prompt_ids
-                except Exception:
-                    pass
-            if msg.get("temperature") is not None:
-                generate_kwargs["temperature"] = float(msg.get("temperature"))
-
-            return_ts: bool | str = False
-            gran = msg.get("ts_granularity")
-            if gran == "word":
-                return_ts = "word"
-            elif gran == "segment":
-                return_ts = True
-
-            result = pipe(
-                msg.get("audio_path"),
-                return_timestamps=return_ts,
-                generate_kwargs=generate_kwargs,
-            )
-
-            conn.send(result)
-        except Exception as exc:  # pragma: no cover - runtime failure
-            conn.send({"err": str(exc), "trace": traceback.format_exc()})

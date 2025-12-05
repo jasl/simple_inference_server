@@ -483,8 +483,12 @@ class ChatBatcher:
             with contextlib.suppress(asyncio.CancelledError):
                 await self._task
         self._task = None
-        for task in list(self._requeue_tasks):
+        requeue_tasks = list(self._requeue_tasks)
+        for task in requeue_tasks:
             task.cancel()
+        if requeue_tasks:
+            with contextlib.suppress(Exception):
+                await asyncio.gather(*requeue_tasks, return_exceptions=True)
         self._requeue_tasks.clear()
 
 

@@ -159,6 +159,11 @@ def stop_accepting() -> None:
     _state["accepting"] = False
 
 
+def start_accepting() -> None:
+    """Allow new work after a prior shutdown."""
+    _state["accepting"] = True
+
+
 async def wait_for_drain(timeout: float = 5.0) -> None:
     """Wait for in-flight work across all limiters to finish, with a timeout."""
     loop = asyncio.get_running_loop()

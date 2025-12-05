@@ -18,9 +18,14 @@ from app.api import router as api_router
 from app.batching import BatchingService
 from app.chat_batching import ChatBatchingService, shutdown_count_executor
 from app.concurrency import audio_limiter as audio_limits, limiter
-from app.concurrency.audio_limiter import stop_accepting as stop_accepting_audio, wait_for_drain as wait_for_drain_audio
-from app.concurrency.limiter import stop_accepting, wait_for_drain
+from app.concurrency.audio_limiter import (
+    start_accepting as start_accepting_audio,
+    stop_accepting as stop_accepting_audio,
+    wait_for_drain as wait_for_drain_audio,
+)
+from app.concurrency.limiter import start_accepting, stop_accepting, wait_for_drain
 from app.logging_config import setup_logging
+from app.middleware import RequestIDMiddleware
 from app.models.registry import ModelRegistry
 from app.monitoring.metrics import setup_metrics
 from app.state import WarmupStatus
@@ -117,6 +122,8 @@ def _init_batching(registry: ModelRegistry) -> tuple[BatchingService, ChatBatchi
 
 def startup() -> tuple[ModelRegistry, BatchingService, ChatBatchingService]:
     setup_logging()
+    start_accepting()
+    start_accepting_audio()
 
     config_path, model_allowlist, device_override = _load_model_config()
     cache_dir = os.environ["HF_HOME"]
@@ -370,4 +377,5 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
 
 
 app = FastAPI(title="Inference Service", lifespan=lifespan)
+app.add_middleware(RequestIDMiddleware)
 app.include_router(api_router)

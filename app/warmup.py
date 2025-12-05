@@ -63,6 +63,7 @@ class WarmupContext:
     device: DeviceLike
     config: WarmupConfig
     executor: ThreadPoolExecutor
+    thread_safe: bool = True
 
 
 @runtime_checkable
@@ -241,6 +242,7 @@ def _warmup_embedding_model(model: object, device: DeviceLike, config: WarmupCon
         device=device,
         config=config,
         executor=executor,
+        thread_safe=bool(getattr(model, "thread_safe", True)),
     )
 
     def _run_once() -> None:
@@ -330,7 +332,7 @@ def _warmup_with_executor(
     run_once: Callable[[], None],
     step_extra: dict[str, float | int | str] | None = None,
 ) -> bool:
-    workers = _select_worker_count(
+    workers = 1 if not context.thread_safe else _select_worker_count(
         device=context.device,
         executor_workers=_executor_workers(context.executor),
         per_worker_vram_mb=context.config.per_worker_vram_mb,
@@ -498,6 +500,7 @@ def _warmup_chat_model(model: object, device: DeviceLike, config: WarmupConfig) 
         device=device,
         config=config,
         executor=executor,
+        thread_safe=bool(getattr(model, "thread_safe", True)),
     )
 
     return _warmup_with_executor(
@@ -540,6 +543,7 @@ def _warmup_audio_model(model: object, device: DeviceLike, config: WarmupConfig)
         device=device,
         config=config,
         executor=executor,
+        thread_safe=bool(getattr(model, "thread_safe", True)),
     )
 
     try:
@@ -597,6 +601,7 @@ def _warmup_vision_model(model: object, device: DeviceLike, config: WarmupConfig
         device=device,
         config=config,
         executor=executor,
+        thread_safe=bool(getattr(model, "thread_safe", True)),
     )
 
     return _warmup_with_executor(

@@ -112,6 +112,11 @@ def stop_accepting() -> None:
     _state["accepting"] = False
 
 
+def start_accepting() -> None:
+    """Allow new audio work after a prior shutdown."""
+    _state["accepting"] = True
+
+
 async def wait_for_drain(timeout: float = 5.0) -> None:
     """Wait for in-flight audio work to finish, with a timeout."""
     loop = asyncio.get_running_loop()
