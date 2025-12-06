@@ -34,7 +34,7 @@ def main() -> None:
     os.environ["MODEL_CONFIG"] = args.config
     os.environ["MODEL_DEVICE"] = args.device
     os.environ["MODELS"] = models_env
-    uvicorn.run("app.main:app", host=args.host, port=args.port, reload=True)  # noqa: S104
+    uvicorn.run("app.main:app", host=args.host, port=args.port, reload=False)  # noqa: S104
 
 
 if __name__ == "__main__":
