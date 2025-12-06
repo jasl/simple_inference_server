@@ -82,6 +82,3 @@ class RequestIDMiddleware(BaseHTTPMiddleware):
         finally:
             # Reset the context variable
             _request_id_var.reset(token)
-
-
-

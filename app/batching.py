@@ -31,10 +31,7 @@ class ModelBatcher:
     def __init__(self, model: Any, max_batch: int, window_ms: float, queue_size: int, queue_timeout: float) -> None:
         self.model = model
         self.max_batch = max_batch
-        self._base_window = max(window_ms / 1000.0, 0.0)
-        self._min_window = self._base_window * 0.5  # Can shrink to 50% of base
-        self._max_window = self._base_window * 2.0  # Can grow to 200% of base
-        self._current_window = self._base_window
+        self.window = max(window_ms / 1000.0, 0.0)
         self._queue_size = max(queue_size, 1)
         # Bounded queue prevents unbounded memory growth under bursty load.
         self.queue: asyncio.Queue[_BatchItem] = asyncio.Queue(self._queue_size)
@@ -43,34 +40,6 @@ class ModelBatcher:
         # multiple workers being spawned under concurrent first use.
         self._start_lock: asyncio.Lock | None = None
         self.queue_timeout = max(queue_timeout, 0.0)
-
-    @property
-    def window(self) -> float:
-        """Current adaptive batch window in seconds."""
-        return self._current_window
-
-    def _adjust_window(self) -> float:
-        """Adjust batch window based on queue depth.
-
-        When queue is fuller, we reduce the window to process faster.
-        When queue empties, we restore toward the base window (never exceeds base).
-
-        This ensures adaptive behavior only improves latency under load,
-        and never makes things worse than the configured baseline.
-        """
-        queue_depth = self.queue.qsize()
-        high_threshold = self._queue_size * 0.75
-        low_threshold = self._queue_size * 0.25
-
-        if queue_depth > high_threshold:
-            # Queue is filling up - reduce window to process faster
-            self._current_window = max(self._current_window * 0.75, self._min_window)
-        elif queue_depth < low_threshold and self._current_window < self._base_window:
-            # Queue is mostly empty and we're below base - restore toward base
-            self._current_window = min(self._current_window * 1.25, self._base_window)
-        # else: keep current window
-
-        return self._current_window
 
     async def start(self) -> None:
         """Explicitly start the worker task.
@@ -110,12 +79,9 @@ class ModelBatcher:
             total = len(item.texts)
             start = time.perf_counter()
 
-            # Adjust window based on queue depth
-            current_window = self._adjust_window()
-
             # Collect within window and max_batch
             while total < self.max_batch:
-                remaining = current_window - (time.perf_counter() - start)
+                remaining = self.window - (time.perf_counter() - start)
                 if remaining <= 0:
                     break
                 try:
