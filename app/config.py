@@ -130,7 +130,7 @@ class Settings(BaseSettings):
     # -------------------------------------------------------------------------
     enable_warmup: bool = True
     warmup_batch_size: int = 1
-    warmup_steps: int = 1
+    warmup_steps: int = 3  # 3 steps to fully warm CUDA kernels and memory allocations
     warmup_inference_mode: bool = True
     warmup_vram_budget_mb: float = 0.0
     warmup_vram_per_worker_mb: float = 1024.0
