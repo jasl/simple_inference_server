@@ -28,7 +28,6 @@ EMBEDDING_MAX_WORKERS = _state["embedding"]["max_workers"]
 CHAT_MAX_WORKERS = _state["chat"]["max_workers"]
 VISION_MAX_WORKERS = _state["vision"]["max_workers"]
 AUDIO_MAX_WORKERS = _state["audio"]["max_workers"]
-EMBEDDING_COUNT_MAX_WORKERS = _state["embedding_count"]["max_workers"]
 
 
 def _get_executor(kind: str, thread_name_prefix: str) -> ThreadPoolExecutor:

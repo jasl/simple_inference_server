@@ -18,7 +18,6 @@ HTTP_NOT_FOUND = 404
 HTTP_BAD_REQUEST = 400
 HTTP_TOO_MANY = 429
 HTTP_GATEWAY_TIMEOUT = 504
-HTTP_CANCELLED = 499
 EXPECTED_TWO = 2
 
 
@@ -125,4 +124,3 @@ def test_rerank_timeout(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(rerank_module, "_run_work_with_client_cancel", _timeout)
     resp = client.post("/v1/rerank", json={"model": "dummy-rerank", "query": "q", "documents": ["a"]})
     assert resp.status_code == HTTP_GATEWAY_TIMEOUT
-
