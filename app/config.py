@@ -8,6 +8,7 @@ from __future__ import annotations
 
 from functools import lru_cache
 
+from pydantic import field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -17,6 +18,7 @@ class Settings(BaseSettings):
     model_config = SettingsConfigDict(
         env_file=".env",
         env_file_encoding="utf-8",
+        env_ignore_empty=True,
         extra="ignore",
     )
 
@@ -115,6 +117,19 @@ class Settings(BaseSettings):
     whisper_subprocess_idle_sec: float = 0.0
     whisper_subprocess_poll_interval_sec: float = 0.05
     whisper_subprocess_max_wall_sec: float | None = None
+
+    @field_validator("whisper_subprocess_max_wall_sec")
+    @classmethod
+    def _normalize_whisper_subprocess_max_wall_sec(cls, value: float | None) -> float | None:
+        """Treat non-positive values as disabled.
+
+        This allows `.env` to use `WHISPER_SUBPROCESS_MAX_WALL_SEC=0` as a safe
+        default while keeping the runtime behavior equivalent to `None`.
+        """
+
+        if value is None:
+            return None
+        return None if value <= 0 else value
 
     # -------------------------------------------------------------------------
     # Vision/remote image settings
