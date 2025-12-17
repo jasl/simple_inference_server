@@ -83,7 +83,9 @@ include = ["app*"]
 line-length = 120
 target-version = "py312"
 src = ["app", "scripts", "tests"]
-exclude = ["models"]  # HF cache dir
+# Exclude the repo-local Hugging Face cache directory at ./models/.
+# NOTE: Use a rooted pattern so we do *not* accidentally exclude app/models.
+exclude = ["models/**"]
 
 [tool.ruff.lint]
 # Start from a sensible baseline and add a few high-signal plugins.
@@ -102,6 +104,12 @@ ignore = []
 
 [tool.ruff.lint.per-file-ignores]
 "tests/*" = ["S101"]  # allow assert in tests
+"app/models/**" = [
+  "PLR0912",  # model handlers contain complex control flow (e.g., IO + validation)
+  "PLR0913",  # OpenAI-compatible method signatures are intentionally wide
+  "PLR0915",  # model handlers often require many explicit steps for clarity
+  "PLR2004",  # magic-value checks are noisy in tensor-shape logic
+]
 
 [tool.ruff.lint.isort]
 combine-as-imports = true
@@ -115,7 +123,9 @@ warn_unused_ignores = true
 disallow_untyped_defs = true
 check_untyped_defs = true
 ignore_missing_imports = true
-exclude = ["models"]
+# Exclude the repo-local Hugging Face cache directory at ./models/.
+# NOTE: Keep app/models included (this is core production code).
+exclude = "^models/"
 
 [[tool.mypy.overrides]]
 module = [

@@ -4,7 +4,6 @@ import logging
 import os
 import threading
 from collections.abc import Sequence
-from typing import Any
 
 import torch
 from transformers import AutoModelForSequenceClassification, AutoTokenizer
@@ -28,12 +27,14 @@ class RerankHandler:
         self.tokenizer = AutoTokenizer.from_pretrained(
             hf_repo_id,
             trust_remote_code=trust_remote_code,
+            local_files_only=True,
             cache_dir=os.environ.get("HF_HOME"),
             use_fast=True,
         )
         self.model = AutoModelForSequenceClassification.from_pretrained(
             hf_repo_id,
             trust_remote_code=trust_remote_code,
+            local_files_only=True,
             cache_dir=os.environ.get("HF_HOME"),
         ).to(self.device)
         self.model.eval()
@@ -64,13 +65,13 @@ class RerankHandler:
         with torch.inference_mode():
             outputs = self.model(**features)
             scores = outputs.logits
-            
+
             # Handle different output shapes
             if scores.dim() == 1:
                 return scores.tolist()
             if scores.shape[1] == 1:
                 return scores.view(-1).tolist()
-            
+
             # If multiple outputs, assume the last one is the "positive" class (common for NLI-based rerankers)
             # or just take the first one if it's a regressor.
             # For standard cross-encoders, usually it's a single score.

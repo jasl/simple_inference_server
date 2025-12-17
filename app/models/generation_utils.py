@@ -74,11 +74,18 @@ class StopOnTokens(StoppingCriteria):
     def __call__(self, input_ids: torch.LongTensor, scores: torch.FloatTensor, **kwargs: Any) -> bool:  # noqa: D401
         if not self.stop_token_ids:
             return False
-        generated = input_ids[0].tolist()
-        for ids in self.stop_token_ids:
-            if len(ids) <= len(generated) and generated[-len(ids) :] == ids:
-                self.triggered = True
-                return True
+        # `transformers.generate` runs stopping criteria at the batch level: returning
+        # True stops generation for the *entire* batch. To avoid truncating other
+        # requests in a batched call, only stop early when *all* sequences have
+        # ended with a stop token sequence (single-item batches behave as usual).
+        sequences: list[list[int]] = [input_ids.tolist()] if input_ids.dim() == 1 else input_ids.tolist()
+
+        def _ends_with_any_stop(seq: list[int]) -> bool:
+            return any(len(ids) <= len(seq) and seq[-len(ids) :] == ids for ids in self.stop_token_ids)
+
+        if all(_ends_with_any_stop(seq) for seq in sequences):
+            self.triggered = True
+            return True
         return False
 
 

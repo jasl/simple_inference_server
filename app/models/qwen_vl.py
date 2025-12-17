@@ -404,7 +404,7 @@ class QwenVLChat(ChatModel):
                 record_remote_image_rejection("host")
                 raise ValueError("Remote image host missing")
             if not host_allowlist:
-                # TODO: tighten remote fetch safety (private ranges, content sniffing) if remote images are enabled.
+                # Remote fetch remains disabled unless an explicit host allowlist is provided.
                 record_remote_image_rejection("allowlist_missing")
                 raise ValueError("Remote image host allowlist is empty; set REMOTE_IMAGE_HOST_ALLOWLIST to enable remote fetch")
             if parsed.hostname not in host_allowlist:

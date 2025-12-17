@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import contextlib
 import multiprocessing.connection
 import os
 import traceback
@@ -67,11 +68,9 @@ def _worker_loop(conn: multiprocessing.connection.Connection, hf_repo_id: str, d
             if msg.get("language"):
                 generate_kwargs["language"] = msg.get("language")
             if msg.get("prompt"):
-                try:
+                with contextlib.suppress(Exception):
                     prompt_ids = processor.get_prompt_ids(msg.get("prompt"), return_tensors="pt")
                     generate_kwargs["prompt_ids"] = prompt_ids
-                except Exception:
-                    pass
             temperature = msg.get("temperature")
             if temperature is not None:
                 generate_kwargs["temperature"] = float(temperature)

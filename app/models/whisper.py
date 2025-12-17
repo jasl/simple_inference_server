@@ -22,7 +22,6 @@ from app.models.base import SpeechModel, SpeechResult, SpeechSegment
 from app.models.generation_utils import StopOnCancel
 from app.models.whisper_worker import _worker_loop
 from app.monitoring.metrics import (
-    record_whisper_init_failure,
     record_whisper_kill,
     record_whisper_restart,
 )
@@ -202,11 +201,19 @@ class WhisperASR(SpeechModel):
             else:
                 return
 
+        # Clean up stale handles (e.g., worker died between requests). Do not
+        # count this as a "kill" since the process is already gone; just ensure
+        # we don't leak pipe FDs or leave a zombie process behind.
         if self._worker_proc is not None:
-            try:
-                self._worker_proc.kill()
-            except Exception:
-                pass
+            proc = self._worker_proc
+            conn = self._parent_conn
+            self._worker_proc = None
+            self._parent_conn = None
+            if conn is not None:
+                with contextlib.suppress(Exception):
+                    conn.close()
+            with contextlib.suppress(Exception):
+                proc.join(timeout=0.0)
 
         if self._proc_ctx is None:
             raise RuntimeError("Subprocess mode not initialized")
@@ -218,6 +225,9 @@ class WhisperASR(SpeechModel):
             daemon=True,
         )
         proc.start()
+        # Parent only needs parent_conn; close the child end to avoid leaking FDs.
+        with contextlib.suppress(Exception):
+            child_conn.close()
         record_whisper_restart(self.hf_repo_id)
         self._parent_conn = parent_conn
         self._worker_proc = proc
@@ -225,16 +235,11 @@ class WhisperASR(SpeechModel):
 
     def _kill_worker(self, log_reason: str | None = None) -> None:
         if self._worker_proc is not None:
-            with contextlib.suppress(Exception):
-                if self._parent_conn is not None:
-                    try:
-                        self._parent_conn.send({"cmd": "stop"})
-                    except Exception:
-                        pass
-                    try:
-                        self._parent_conn.close()
-                    except Exception:
-                        pass
+            if self._parent_conn is not None:
+                with contextlib.suppress(Exception):
+                    self._parent_conn.send({"cmd": "stop"})
+                with contextlib.suppress(Exception):
+                    self._parent_conn.close()
             self._worker_proc.join(timeout=1.0)
             if self._worker_proc.is_alive():
                 with contextlib.suppress(Exception):

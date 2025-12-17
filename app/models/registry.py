@@ -4,7 +4,7 @@ import importlib
 import logging
 from collections.abc import Callable, Iterable
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 
 import torch
 import yaml
@@ -65,7 +65,7 @@ class ModelRegistry:
             model = handler_factory(repo, self.device)
             # Optional per-model generation defaults (e.g., temperature, top_p, max_tokens) for chat-capable models only.
             if gen_defaults and "chat-completion" in getattr(model, "capabilities", []):
-                setattr(model, "generation_defaults", gen_defaults)
+                cast(Any, model).generation_defaults = gen_defaults
             elif gen_defaults:
                 logger.debug("Ignoring generation defaults for non-chat model %s", name)
 
