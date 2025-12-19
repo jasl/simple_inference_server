@@ -127,6 +127,35 @@ class TestSimpleInferenceClient < Minitest::Test
     assert_includes adapter.last_request[:headers]["Accept"], "text/event-stream"
   end
 
+  def test_chat_completions_stream_skips_empty_data_events
+    adapter = Class.new do
+      def call_stream(_env)
+        sse = +""
+        sse << "data:\n\n"
+        sse << %(data: {"id":"evt1","choices":[{"delta":{"content":"ok"}}]}\n\n)
+        sse << "data: [DONE]\n\n"
+
+        yield sse
+
+        {
+          status: 200,
+          headers: { "content-type" => "text/event-stream" },
+          body: nil,
+        }
+      end
+    end.new
+
+    client = SimpleInference::Client.new(base_url: "http://example.com", adapter: adapter)
+    events = client.chat_completions_stream(model: "foo", messages: []).to_a
+
+    assert_equal(
+      [
+        { "id" => "evt1", "choices" => [{ "delta" => { "content" => "ok" } }] },
+      ],
+      events
+    )
+  end
+
   def test_chat_completions_stream_falls_back_when_streaming_unsupported
     adapter = Class.new do
       attr_reader :stream_request, :requests

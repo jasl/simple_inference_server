@@ -182,6 +182,7 @@ module SimpleInference
               next if data.nil?
 
               payload = data.strip
+              next if payload.empty?
               if payload == "[DONE]"
                 sse_done = true
                 sse_buffer.clear
@@ -212,6 +213,7 @@ module SimpleInference
             next if data.nil?
 
             payload = data.strip
+            next if payload.empty?
             break if payload == "[DONE]"
 
             on_event&.call(parse_json_event(payload))
@@ -301,7 +303,7 @@ module SimpleInference
         next if line.start_with?(":")
         next unless line.start_with?("data:")
 
-        data_lines << line[5..].to_s.lstrip
+        data_lines << (line[5..]&.lstrip).to_s
       end
 
       return nil if data_lines.empty?
