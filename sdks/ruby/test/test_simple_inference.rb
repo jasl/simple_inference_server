@@ -2,9 +2,9 @@
 
 require "test_helper"
 
-class TestSimpleInferenceSdk < Minitest::Test
+class TestSimpleInference < Minitest::Test
   def test_that_it_has_a_version_number
-    refute_nil ::SimpleInferenceSdk::VERSION
+    refute_nil ::SimpleInference::VERSION
   end
 
   def test_simple_inference_is_loaded

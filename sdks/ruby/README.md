@@ -7,7 +7,7 @@ Fiber-friendly Ruby client for the Simple Inference Server APIs (chat, embedding
 Add the gem to your Rails application's `Gemfile`, pointing at this repository path:
 
 ```ruby
-gem "simple_inference_sdk", path: "sdks/ruby"
+gem "simple_inference", path: "sdks/ruby"
 ```
 
 Then run:
@@ -224,39 +224,21 @@ The default HTTP adapter uses Ruby's `Net::HTTP` and is safe to use under Puma's
 - Per-client configuration only
 - Blocking IO that integrates with Ruby 3 Fiber scheduler
 
-For Falcon / async environments, you can keep the default adapter, or plug in a Fiber-native client (for example `httpx`) by providing a custom adapter:
+For Falcon / async environments, you can keep the default adapter, or use the optional HTTPX adapter (requires the `httpx` gem):
 
 ```ruby
-require "httpx"
+gem "httpx" # optional, only required when using the HTTPX adapter
+```
 
-class SimpleInferenceHTTPXAdapter
-  def initialize
-    @client = HTTPX.with(
-      timeout: {
-        operation_timeout: 30
-      }
-    )
-  end
+You can then use the optional HTTPX adapter shipped with this gem:
 
-  def call(env)
-    method  = env[:method].to_s.downcase.to_sym
-    url     = env[:url]
-    headers = env[:headers] || {}
-    body    = env[:body]
+```ruby
+adapter = SimpleInference::HTTPAdapter::HTTPX.new(timeout: 30.0)
 
-    response = @client.request(method, url, headers: headers, body: body)
-
-    {
-      status:  response.status,
-      headers: response.headers.to_h,
-      body:    response.to_s
-    }
-  end
-end
-
-SIMPLE_INFERENCE_CLIENT = SimpleInference::Client.new(
-  base_url: ENV.fetch("SIMPLE_INFERENCE_BASE_URL", "http://localhost:8000"),
-  api_key:  ENV["SIMPLE_INFERENCE_API_KEY"],
-  adapter:  SimpleInferenceHTTPXAdapter.new
-)
+SIMPLE_INFERENCE_CLIENT =
+  SimpleInference::Client.new(
+    base_url: ENV.fetch("SIMPLE_INFERENCE_BASE_URL", "http://localhost:8000"),
+    api_key:  ENV["SIMPLE_INFERENCE_API_KEY"],
+    adapter:  adapter
+  )
 ```

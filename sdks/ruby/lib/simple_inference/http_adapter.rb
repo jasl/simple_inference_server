@@ -5,6 +5,9 @@ require "uri"
 
 module SimpleInference
   module HTTPAdapter
+    # Optional adapters are lazily loaded so the SDK has no hard runtime deps.
+    autoload :HTTPX, "simple_inference/http_adapter/httpx"
+
     # Default synchronous HTTP adapter built on Net::HTTP.
     # It is compatible with Ruby 3 Fiber scheduler and keeps the interface
     # minimal so it can be swapped out for custom adapters (HTTPX, async-http, etc.).
