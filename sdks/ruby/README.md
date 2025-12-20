@@ -224,6 +224,8 @@ The default HTTP adapter uses Ruby's `Net::HTTP` and is safe to use under Puma's
 - Per-client configuration only
 - Blocking IO that integrates with Ruby 3 Fiber scheduler
 
+If you don't pass an adapter, `SimpleInference::Client` uses `SimpleInference::HTTPAdapters::Default` (Net::HTTP).
+
 For Falcon / async environments, you can keep the default adapter, or use the optional HTTPX adapter (requires the `httpx` gem):
 
 ```ruby
@@ -233,7 +235,7 @@ gem "httpx" # optional, only required when using the HTTPX adapter
 You can then use the optional HTTPX adapter shipped with this gem:
 
 ```ruby
-adapter = SimpleInference::HTTPAdapter::HTTPX.new(timeout: 30.0)
+adapter = SimpleInference::HTTPAdapters::HTTPX.new(timeout: 30.0)
 
 SIMPLE_INFERENCE_CLIENT =
   SimpleInference::Client.new(

@@ -4,17 +4,33 @@ begin
   require "httpx"
 rescue LoadError => e
   raise LoadError,
-        "httpx gem is required for SimpleInference::HTTPAdapter::HTTPX (add `gem \"httpx\"`)",
+        "httpx gem is required for SimpleInference::HTTPAdapters::HTTPX (add `gem \"httpx\"`)",
         cause: e
 end
 
+# HTTPX's stream plugin expects all request objects to respond to `#stream`,
+# however some internal requests (e.g. proxy CONNECT) don't include the plugin's
+# RequestMethods. Add a harmless accessor at the base class level.
+unless ::HTTPX::Request.method_defined?(:stream) && ::HTTPX::Request.method_defined?(:stream=)
+  ::HTTPX::Request.class_eval do
+    attr_accessor :stream
+  end
+end
+
 module SimpleInference
-  module HTTPAdapter
+  module HTTPAdapters
     # Fiber-friendly HTTP adapter built on HTTPX.
-    class HTTPX
+    class HTTPX < HTTPAdapter
       def initialize(timeout: nil, client: ::HTTPX)
         @timeout = timeout
+
+        unless client == ::HTTPX || client.is_a?(::HTTPX::Session)
+          raise ArgumentError,
+                "client must be ::HTTPX or an instance of ::HTTPX::Session (got #{client.class})"
+        end
+
         @client = client
+        @stream_client = client.plugin(:stream)
       end
 
       def call(request)
@@ -47,14 +63,12 @@ module SimpleInference
         #
         # NOTE: Some error response objects do not expose the normal response API
         # (e.g. no `#headers`), so we must handle them explicitly.
-        if defined?(::HTTPX::ErrorResponse) && response.is_a?(::HTTPX::ErrorResponse)
-          err = response.respond_to?(:error) ? response.error : nil
-          raise Errors::ConnectionError, (err ? err.message : "HTTPX request failed")
+        if response.is_a?(::HTTPX::ErrorResponse)
+          raise Errors::ConnectionError, (response.error&.message || "HTTPX request failed")
         end
 
-        if response.respond_to?(:status) && response.status.to_i == 0
-          err = response.respond_to?(:error) ? response.error : nil
-          raise Errors::ConnectionError, (err ? err.message : "HTTPX request failed")
+        if response.status.to_i == 0
+          raise Errors::ConnectionError, "HTTPX request failed"
         end
 
         response_headers = normalize_headers(response)
@@ -62,7 +76,7 @@ module SimpleInference
         {
           status: response.status.to_i,
           headers: response_headers,
-          body: response.respond_to?(:body) ? response.body.to_s : "",
+          body: response.body.to_s,
         }
       rescue ::HTTPX::TimeoutError => e
         raise Errors::TimeoutError, e.message
@@ -77,8 +91,6 @@ module SimpleInference
         url = request.fetch(:url)
         headers = request[:headers] || {}
         body = request[:body]
-
-        client = @client
 
         # Mirror the SDK's timeout semantics:
         # - `:timeout` is the overall request deadline (maps to HTTPX `request_timeout`)
@@ -96,20 +108,13 @@ module SimpleInference
         timeout_opts[:connect_timeout] = open_timeout.to_f if open_timeout
         timeout_opts[:read_timeout] = read_timeout.to_f if read_timeout
 
-        unless client.respond_to?(:plugin)
-          return call_stream_via_full_body(
-            method: method,
-            url: url,
-            headers: headers,
-            body: body,
-            timeout: timeout,
-            open_timeout: open_timeout,
-            read_timeout: read_timeout
-          ) { |chunk| yield chunk }
-        end
-
-        client = client.plugin(:stream)
-        client = client.with(timeout: timeout_opts) unless timeout_opts.empty?
+        stream_client = @stream_client
+        client =
+          if timeout_opts.empty?
+            stream_client.with(timeout: {})
+          else
+            stream_client.with(timeout: timeout_opts)
+          end
 
         streaming = nil
         response_headers = {}
@@ -118,9 +123,17 @@ module SimpleInference
 
         stream_response = client.request(method, url, headers: headers, body: body, stream: true)
 
+        if stream_response.is_a?(::HTTPX::ErrorResponse)
+          raise Errors::ConnectionError, (stream_response.error&.message || "HTTPX request failed")
+        end
+
+        if stream_response.status.to_i == 0
+          raise Errors::ConnectionError, "HTTPX request failed"
+        end
+
         begin
           stream_response.each do |chunk|
-            status ||= stream_response.respond_to?(:status) ? stream_response.status.to_i : nil
+            status ||= stream_response.status.to_i
             response_headers = normalize_headers(stream_response) if response_headers.empty?
             streaming = streamable_sse?(status, response_headers) if streaming.nil?
 
@@ -133,11 +146,11 @@ module SimpleInference
         rescue ::HTTPX::HTTPError => e
           # HTTPX's stream plugin raises for non-2xx. Swallow it and let the SDK
           # raise `Errors::HTTPError` based on status.
-          status ||= e.response.status.to_i if e.respond_to?(:response) && e.response.respond_to?(:status)
-          response_headers = normalize_headers(e.response) if response_headers.empty? && e.respond_to?(:response)
+          status ||= e.response.status.to_i
+          response_headers = normalize_headers(e.response) if response_headers.empty?
         end
 
-        status ||= stream_response.respond_to?(:status) ? stream_response.status.to_i : 0
+        status ||= stream_response.status.to_i
         response_headers = normalize_headers(stream_response) if response_headers.empty?
 
         if streamable_sse?(status, response_headers)
@@ -154,8 +167,6 @@ module SimpleInference
       private
 
       def normalize_headers(response)
-        return {} unless response.respond_to?(:headers)
-
         response.headers.to_h.each_with_object({}) do |(k, v), out|
           out[k.to_s] = v.is_a?(Array) ? v.join(", ") : v.to_s
         end
@@ -170,33 +181,6 @@ module SimpleInference
           end["content-type"].to_s
 
         content_type.include?("text/event-stream")
-      end
-
-      def call_stream_via_full_body(method:, url:, headers:, body:, timeout:, open_timeout:, read_timeout:)
-        response =
-          call(
-            {
-              method: method,
-              url: url,
-              headers: headers,
-              body: body,
-              timeout: timeout,
-              open_timeout: open_timeout,
-              read_timeout: read_timeout,
-            }
-          )
-
-        content_type =
-          (response[:headers] || {}).each_with_object({}) do |(k, v), out|
-            out[k.to_s.downcase] = v
-          end["content-type"].to_s
-
-        if response[:status].to_i >= 200 && response[:status].to_i < 300 && content_type.include?("text/event-stream")
-          yield response[:body].to_s
-          return { status: response[:status].to_i, headers: response[:headers] || {}, body: nil }
-        end
-
-        response
       end
     end
   end

@@ -12,7 +12,12 @@ module SimpleInference
 
     def initialize(options = {})
       @config = Config.new(options || {})
-      @adapter = @config.adapter || HTTPAdapter::Default.new
+      @adapter = @config.adapter || HTTPAdapters::Default.new
+
+      unless @adapter.is_a?(HTTPAdapter)
+        raise Errors::ConfigurationError,
+              "adapter must be an instance of SimpleInference::HTTPAdapter (got #{@adapter.class})"
+      end
     end
 
     # POST /v1/chat/completions
@@ -168,32 +173,15 @@ module SimpleInference
     def handle_stream_response(request_env, raise_on_http_error:, &on_event)
       sse_buffer = +""
       sse_done = false
-      used_streaming_adapter = false
+      streamed = false
 
       raw_response =
-        if @adapter.respond_to?(:call_stream)
-          used_streaming_adapter = true
-          @adapter.call_stream(request_env) do |chunk|
-            next if sse_done
+        @adapter.call_stream(request_env) do |chunk|
+          streamed = true
+          next if sse_done
 
-            sse_buffer << chunk.to_s
-            extract_sse_blocks!(sse_buffer).each do |block|
-              data = sse_data_from_block(block)
-              next if data.nil?
-
-              payload = data.strip
-              next if payload.empty?
-              if payload == "[DONE]"
-                sse_done = true
-                sse_buffer.clear
-                break
-              end
-
-              on_event&.call(parse_json_event(payload))
-            end
-          end
-        else
-          @adapter.call(request_env)
+          sse_buffer << chunk.to_s
+          sse_done = consume_sse_buffer!(sse_buffer, &on_event) || sse_done
         end
 
       status = raw_response[:status]
@@ -206,18 +194,9 @@ module SimpleInference
       # Streaming case.
       if status >= 200 && status < 300 && content_type.include?("text/event-stream")
         # If we couldn't stream incrementally, best-effort parse the full SSE body.
-        unless used_streaming_adapter
+        unless streamed
           buffer = body_str.dup
-          extract_sse_blocks!(buffer).each do |block|
-            data = sse_data_from_block(block)
-            next if data.nil?
-
-            payload = data.strip
-            next if payload.empty?
-            break if payload == "[DONE]"
-
-            on_event&.call(parse_json_event(payload))
-          end
+          consume_sse_buffer!(buffer, &on_event)
         end
 
         return {
@@ -231,39 +210,14 @@ module SimpleInference
       should_parse_json = content_type.include?("json")
       parsed_body = should_parse_json ? parse_json(body_str) : body_str
 
-      raise_on =
-        if raise_on_http_error.nil?
-          config.raise_on_error
-        else
-          !!raise_on_http_error
-        end
-
-      if raise_on && (status < 200 || status >= 300)
-        # Do not raise for the known "streaming unsupported" case; the caller will
-        # perform a non-streaming retry fallback.
-        unless streaming_unsupported_error?(status, parsed_body)
-          message = "HTTP #{status}"
-          begin
-            error_body = JSON.parse(body_str)
-            error_field = error_body["error"]
-            message =
-              if error_field.is_a?(Hash)
-                error_field["message"] || error_body["message"] || message
-              else
-                error_field || error_body["message"] || message
-              end
-          rescue JSON::ParserError
-            # fall back to generic message
-          end
-
-          raise Errors::HTTPError.new(
-            message,
-            status: status,
-            headers: headers,
-            body: body_str
-          )
-        end
-      end
+      maybe_raise_http_error(
+        status: status,
+        headers: headers,
+        body_str: body_str,
+        raise_on_http_error: raise_on_http_error,
+        ignore_streaming_unsupported: true,
+        parsed_body: parsed_body
+      )
 
       {
         status: status,
@@ -292,6 +246,27 @@ module SimpleInference
       end
 
       blocks
+    end
+
+    def consume_sse_buffer!(buffer, &on_event)
+      done = false
+
+      extract_sse_blocks!(buffer).each do |block|
+        data = sse_data_from_block(block)
+        next if data.nil?
+
+        payload = data.strip
+        next if payload.empty?
+        if payload == "[DONE]"
+          done = true
+          buffer.clear
+          break
+        end
+
+        on_event&.call(parse_json_event(payload))
+      end
+
+      done
     end
 
     def sse_data_from_block(block)
@@ -600,37 +575,12 @@ module SimpleInference
       headers = (response[:headers] || {}).transform_keys { |k| k.to_s.downcase }
       body = response[:body].to_s
 
-      # Decide whether to raise on HTTP errors
-      raise_on =
-        if raise_on_http_error.nil?
-          config.raise_on_error
-        else
-          !!raise_on_http_error
-        end
-
-      if raise_on && (status < 200 || status >= 300)
-        message = "HTTP #{status}"
-
-        begin
-          error_body = JSON.parse(body)
-          error_field = error_body["error"]
-          message =
-            if error_field.is_a?(Hash)
-              error_field["message"] || error_body["message"] || message
-            else
-              error_field || error_body["message"] || message
-            end
-        rescue JSON::ParserError
-          # fall back to generic message
-        end
-
-        raise Errors::HTTPError.new(
-          message,
-          status: status,
-          headers: headers,
-          body: body
-        )
-      end
+      maybe_raise_http_error(
+        status: status,
+        headers: headers,
+        body_str: body,
+        raise_on_http_error: raise_on_http_error
+      )
 
       should_parse_json =
         if expect_json.nil?
@@ -664,6 +614,57 @@ module SimpleInference
       JSON.parse(body)
     rescue JSON::ParserError => e
       raise Errors::DecodeError, "Failed to parse JSON response: #{e.message}"
+    end
+
+    def raise_on_http_error?(raise_on_http_error)
+      raise_on_http_error.nil? ? config.raise_on_error : !!raise_on_http_error
+    end
+
+    def http_error_message(status, body_str, parsed_body: nil)
+      message = "HTTP #{status}"
+
+      error_body =
+        if parsed_body.is_a?(Hash)
+          parsed_body
+        else
+          begin
+            JSON.parse(body_str)
+          rescue JSON::ParserError
+            nil
+          end
+        end
+
+      return message unless error_body.is_a?(Hash)
+
+      error_field = error_body["error"]
+      if error_field.is_a?(Hash)
+        error_field["message"] || error_body["message"] || message
+      else
+        error_field || error_body["message"] || message
+      end
+    end
+
+    def maybe_raise_http_error(
+      status:,
+      headers:,
+      body_str:,
+      raise_on_http_error:,
+      ignore_streaming_unsupported: false,
+      parsed_body: nil
+    )
+      return unless raise_on_http_error?(raise_on_http_error)
+      return unless status < 200 || status >= 300
+
+      # Do not raise for the known "streaming unsupported" case; the caller will
+      # perform a non-streaming retry fallback.
+      return if ignore_streaming_unsupported && streaming_unsupported_error?(status, parsed_body)
+
+      raise Errors::HTTPError.new(
+        http_error_message(status, body_str, parsed_body: parsed_body),
+        status: status,
+        headers: headers,
+        body: body_str
+      )
     end
   end
 end

@@ -2,7 +2,7 @@
 
 require "test_helper"
 
-require "simple_inference/http_adapter/httpx"
+require "simple_inference/http_adapters/httpx"
 
 class TestHTTPXAdapter < Minitest::Test
   class FakeStreamResponse
@@ -30,9 +30,11 @@ class TestHTTPXAdapter < Minitest::Test
     end
   end
 
-  class FakeClient
-    def initialize(stream_response)
-      @stream_response = stream_response
+  class FakeClient < ::HTTPX::Session
+    def self.build(response)
+      obj = allocate
+      obj.instance_variable_set(:@response, response)
+      obj
     end
 
     def plugin(_name)
@@ -48,7 +50,7 @@ class TestHTTPXAdapter < Minitest::Test
       _headers = headers
       _body = body
       _stream = stream
-      @stream_response
+      @response
     end
   end
 
@@ -62,25 +64,7 @@ class TestHTTPXAdapter < Minitest::Test
     response = ::HTTPX::ErrorResponse.allocate
     response.define_singleton_method(:status) { 599 }
     response.define_singleton_method(:error) { err }
-
-    fake_client = Class.new do
-      def initialize(response)
-        @response = response
-      end
-
-      def with(timeout:)
-        _timeout = timeout
-        self
-      end
-
-      def request(_method, _url, headers: {}, body: nil, **_kwargs)
-        _headers = headers
-        _body = body
-        @response
-      end
-    end.new(response)
-
-    adapter = SimpleInference::HTTPAdapter::HTTPX.new(client: fake_client)
+    adapter = SimpleInference::HTTPAdapters::HTTPX.new(client: FakeClient.build(response))
 
     e =
       assert_raises(SimpleInference::Errors::ConnectionError) do
@@ -98,7 +82,7 @@ class TestHTTPXAdapter < Minitest::Test
         chunks: ["data: 1\n\n", "data: 2\n\n"]
       )
 
-    adapter = SimpleInference::HTTPAdapter::HTTPX.new(client: FakeClient.new(response))
+    adapter = SimpleInference::HTTPAdapters::HTTPX.new(client: FakeClient.build(response))
 
     yielded = []
     resp =
@@ -120,7 +104,7 @@ class TestHTTPXAdapter < Minitest::Test
         chunks: ['{"ok":', "true}"]
       )
 
-    adapter = SimpleInference::HTTPAdapter::HTTPX.new(client: FakeClient.new(response))
+    adapter = SimpleInference::HTTPAdapters::HTTPX.new(client: FakeClient.build(response))
 
     yielded = []
     resp =
@@ -142,7 +126,7 @@ class TestHTTPXAdapter < Minitest::Test
         raise_http_error: true
       )
 
-    adapter = SimpleInference::HTTPAdapter::HTTPX.new(client: FakeClient.new(response))
+    adapter = SimpleInference::HTTPAdapters::HTTPX.new(client: FakeClient.build(response))
 
     yielded = []
     resp =
@@ -153,5 +137,22 @@ class TestHTTPXAdapter < Minitest::Test
     assert_equal [], yielded
     assert_equal 401, resp[:status]
     assert_equal '{"error":"nope"}', resp[:body]
+  end
+
+  def test_httpx_request_has_stream_accessor
+    assert ::HTTPX::Request.method_defined?(:stream)
+    assert ::HTTPX::Request.method_defined?(:stream=)
+  end
+
+  def test_proxy_connect_request_inherits_stream_accessor
+    begin
+      require "httpx/plugins/proxy/http"
+    rescue LoadError
+      skip "httpx/plugins/proxy/http not available"
+    end
+
+    klass = ::HTTPX::Plugins::Proxy::HTTP::ConnectRequest
+    assert klass.method_defined?(:stream)
+    assert klass.method_defined?(:stream=)
   end
 end

@@ -6,7 +6,7 @@ require "test_helper"
 
 class TestSimpleInferenceClient < Minitest::Test
   def test_chat_completions_sends_to_openai_path
-    adapter = Class.new do
+    adapter = Class.new(SimpleInference::HTTPAdapter) do
       attr_reader :last_request
 
       def call(env)
@@ -29,7 +29,7 @@ class TestSimpleInferenceClient < Minitest::Test
   end
 
   def test_parses_json_responses_into_hashes
-    adapter = Class.new do
+    adapter = Class.new(SimpleInference::HTTPAdapter) do
       def call(_env)
         {
           status: 200,
@@ -47,7 +47,7 @@ class TestSimpleInferenceClient < Minitest::Test
   end
 
   def test_healthy_helper
-    adapter = Class.new do
+    adapter = Class.new(SimpleInference::HTTPAdapter) do
       def call(_env)
         {
           status: 200,
@@ -62,7 +62,7 @@ class TestSimpleInferenceClient < Minitest::Test
   end
 
   def test_raises_http_error_on_non_2xx_when_raise_on_error_true
-    adapter = Class.new do
+    adapter = Class.new(SimpleInference::HTTPAdapter) do
       def call(_env)
         {
           status: 500,
@@ -82,7 +82,7 @@ class TestSimpleInferenceClient < Minitest::Test
   end
 
   def test_raises_http_error_uses_nested_error_message
-    adapter = Class.new do
+    adapter = Class.new(SimpleInference::HTTPAdapter) do
       def call(_env)
         {
           status: 401,
@@ -102,7 +102,7 @@ class TestSimpleInferenceClient < Minitest::Test
   end
 
   def test_audio_transcriptions_uses_streaming_multipart_body
-    adapter = Class.new do
+    adapter = Class.new(SimpleInference::HTTPAdapter) do
       attr_reader :last_request, :last_body
 
       def call(env)
@@ -140,7 +140,7 @@ class TestSimpleInferenceClient < Minitest::Test
   end
 
   def test_chat_completions_stream_yields_parsed_sse_events
-    adapter = Class.new do
+    adapter = Class.new(SimpleInference::HTTPAdapter) do
       attr_reader :last_request
 
       def call_stream(env)
@@ -187,7 +187,7 @@ class TestSimpleInferenceClient < Minitest::Test
   end
 
   def test_chat_completions_stream_skips_empty_data_events
-    adapter = Class.new do
+    adapter = Class.new(SimpleInference::HTTPAdapter) do
       def call_stream(_env)
         sse = +""
         sse << "data:\n\n"
@@ -216,7 +216,7 @@ class TestSimpleInferenceClient < Minitest::Test
   end
 
   def test_chat_completions_stream_falls_back_when_streaming_unsupported
-    adapter = Class.new do
+    adapter = Class.new(SimpleInference::HTTPAdapter) do
       attr_reader :stream_request, :requests
 
       def initialize
