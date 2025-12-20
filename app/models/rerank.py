@@ -91,17 +91,10 @@ class RerankHandler:
         pairs = [(query, str(doc)) for doc in documents]
         scores = self.predict(pairs, cancel_event=cancel_event)
 
-        indexed_scores = [
-            (idx, float(score), str(documents[idx]))
-            for idx, score in enumerate(scores)
-        ]
+        indexed_scores = [(idx, float(score), str(documents[idx])) for idx, score in enumerate(scores)]
 
         ranked = sorted(indexed_scores, key=lambda x: x[1], reverse=True)
         if top_k is not None:
             ranked = ranked[:top_k]
 
-        return [
-            RerankResult(index=idx, relevance_score=score, document=doc)
-            for idx, score, doc in ranked
-        ]
-
+        return [RerankResult(index=idx, relevance_score=score, document=doc) for idx, score, doc in ranked]

@@ -90,9 +90,7 @@ class ChatModel(Protocol):
         cancel_events: list[threading.Event] | None = None,
     ) -> list[ChatGeneration]: ...
 
-    def count_tokens(
-        self, messages: Sequence[dict[str, Any]], *, add_generation_prompt: bool = True
-    ) -> int: ...
+    def count_tokens(self, messages: Sequence[dict[str, Any]], *, add_generation_prompt: bool = True) -> int: ...
 
 
 @dataclass

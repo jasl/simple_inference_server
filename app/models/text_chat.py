@@ -75,7 +75,7 @@ class TextChatModel(ChatModel):
         top_p: float,
         stop: list[str] | None = None,
         cancel_event: threading.Event | None = None,
-        ) -> ChatGeneration:
+    ) -> ChatGeneration:
         stop_criteria, stop_flag = self._build_stop_criteria(stop, cancel_event)
         prepared_inputs, prompt_len = self.prepare_inputs(messages, add_generation_prompt=True)
         inputs = self._move_to_device({k: v for k, v in prepared_inputs.items() if k != "_prompt_len"})
@@ -321,9 +321,7 @@ class TextChatModel(ChatModel):
         device = getattr(self.model, "device", None)
         return bool(torch.cuda.is_available() and device is not None and str(device).startswith("cuda"))
 
-    def count_tokens(
-        self, messages: Sequence[dict[str, Any]], *, add_generation_prompt: bool = True
-    ) -> int:
+    def count_tokens(self, messages: Sequence[dict[str, Any]], *, add_generation_prompt: bool = True) -> int:
         """Count tokens in a message sequence.
 
         By default, includes the generation prompt to match what will actually
@@ -359,9 +357,7 @@ class TextChatModel(ChatModel):
     def _build_stop_criteria(
         self, stop: list[str] | None, cancel_event: threading.Event | None
     ) -> tuple[StoppingCriteriaList | None, StopOnTokens | None]:
-        stop_token_ids = [
-            self.tokenizer.encode(s, add_special_tokens=False) for s in (stop or []) if s
-        ]
+        stop_token_ids = [self.tokenizer.encode(s, add_special_tokens=False) for s in (stop or []) if s]
         return build_stop_criteria(stop_token_ids, cancel_event)
 
     def _resolve_device_map(self, device_pref: str) -> str | None:

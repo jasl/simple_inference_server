@@ -45,9 +45,7 @@ class HFEmbeddingModel(EmbeddingModel):
         self.dim = self.model.config.hidden_size
 
     @torch.no_grad()
-    def _encode(
-        self, texts: list[str], cancel_event: threading.Event | None = None
-    ) -> np.ndarray:
+    def _encode(self, texts: list[str], cancel_event: threading.Event | None = None) -> np.ndarray:
         """Encode texts with cooperative cancellation between steps.
 
         Checks cancel_event between tokenization, forward pass, and normalization
@@ -110,5 +108,3 @@ class HFEmbeddingModel(EmbeddingModel):
             )
             self._tokenizer_local.tokenizer = tok
         return tok
-
-

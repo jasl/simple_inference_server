@@ -91,4 +91,3 @@ def _worker_loop(conn: multiprocessing.connection.Connection, hf_repo_id: str, d
             conn.send(result)
         except Exception as exc:  # pragma: no cover - runtime failure
             conn.send({"err": str(exc), "trace": traceback.format_exc()})
-

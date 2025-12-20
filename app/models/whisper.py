@@ -157,7 +157,6 @@ class WhisperASR(SpeechModel):
 
         return kwargs
 
-
     def _to_speech_result(self, result: dict, language: str | None) -> SpeechResult:
         text = (result.get("text") or "").strip()
         language_out = result.get("language") or language

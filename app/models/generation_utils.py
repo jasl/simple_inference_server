@@ -205,9 +205,7 @@ def normalize_chat_template_output(
 
         if not torch.is_tensor(value):
             if drop_non_tensor:
-                logger.debug(
-                    "Dropping non-tensor chat template field %s (%s)", key, type(value).__name__
-                )
+                logger.debug("Dropping non-tensor chat template field %s (%s)", key, type(value).__name__)
                 continue
             raise ValueError(f"Field {key} is not a tensor")
 
@@ -224,5 +222,3 @@ def normalize_chat_template_output(
         raise ValueError("Output missing 'input_ids' tensor")
 
     return normalized
-
-

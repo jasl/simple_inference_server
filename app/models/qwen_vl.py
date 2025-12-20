@@ -251,9 +251,7 @@ class QwenVLChat(ChatModel):
             return None
         return "auto"
 
-    def count_tokens(
-        self, messages: Sequence[dict[str, Any]], *, add_generation_prompt: bool = True
-    ) -> int:
+    def count_tokens(self, messages: Sequence[dict[str, Any]], *, add_generation_prompt: bool = True) -> int:
         """Count tokens in a message sequence.
 
         By default, includes the generation prompt to match what will actually
@@ -321,9 +319,7 @@ class QwenVLChat(ChatModel):
     def _build_stop_criteria(
         self, stop: list[str] | None, cancel_event: threading.Event | None
     ) -> tuple[StoppingCriteriaList | None, StopOnTokens | None]:
-        stop_token_ids = [
-            self.processor.tokenizer.encode(s, add_special_tokens=False) for s in (stop or []) if s
-        ]
+        stop_token_ids = [self.processor.tokenizer.encode(s, add_special_tokens=False) for s in (stop or []) if s]
         return build_stop_criteria(stop_token_ids, cancel_event)
 
     def _normalize_chat_template_output(self, raw_inputs: Any) -> dict[str, torch.Tensor]:
@@ -406,7 +402,9 @@ class QwenVLChat(ChatModel):
             if not host_allowlist:
                 # Remote fetch remains disabled unless an explicit host allowlist is provided.
                 record_remote_image_rejection("allowlist_missing")
-                raise ValueError("Remote image host allowlist is empty; set REMOTE_IMAGE_HOST_ALLOWLIST to enable remote fetch")
+                raise ValueError(
+                    "Remote image host allowlist is empty; set REMOTE_IMAGE_HOST_ALLOWLIST to enable remote fetch"
+                )
             if parsed.hostname not in host_allowlist:
                 record_remote_image_rejection("host")
                 raise ValueError("Remote image host not allowed")
