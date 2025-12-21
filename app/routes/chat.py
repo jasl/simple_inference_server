@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import inspect
+import json
 import logging
 import threading
 import time
@@ -9,8 +10,9 @@ from collections.abc import Sequence
 from typing import Annotated, Any, Literal
 from uuid import uuid4
 
+import jsonschema
 from fastapi import APIRouter, Depends, HTTPException, Request, status
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from app.chat_batching import ChatBatchQueueFullError, ChatBatchQueueTimeoutError, get_count_executor
 from app.concurrency.limiter import (
@@ -43,6 +45,9 @@ from app.threadpool import get_chat_executor, get_vision_executor
 
 logger = logging.getLogger(__name__)
 router = APIRouter()
+
+_STRUCTURED_OUTPUT_ERROR_MAX_CHARS = 400
+_STRUCTURED_OUTPUT_PREVIOUS_OUTPUT_MAX_CHARS = 4000
 
 
 class ImageURL(BaseModel):
@@ -83,6 +88,40 @@ class ChatCompletionChoice(BaseModel):
     finish_reason: str = "stop"
 
 
+class ChatResponseFormatJsonSchema(BaseModel):
+    """OpenAI-compatible json_schema response_format payload."""
+
+    model_config = ConfigDict(populate_by_name=True)
+
+    name: str | None = None
+    schema_: dict[str, Any] = Field(alias="schema")
+    strict: bool | None = None
+
+
+class ChatResponseFormat(BaseModel):
+    """OpenAI-compatible response_format for chat completions.
+
+    Supported:
+      - {"type": "text"} (default)
+      - {"type": "json_object"} (best-effort; server enforces valid JSON object)
+      - {"type": "json_schema", "json_schema": {"name": "...", "schema": {...}, "strict": true}}
+    """
+
+    type: Literal["text", "json_object", "json_schema"]
+    json_schema: ChatResponseFormatJsonSchema | None = None
+    # Compatibility shim: some clients may send `strict` alongside `type`, but
+    # OpenAI's canonical shape nests it under `json_schema`.
+    strict: bool | None = None
+
+    @model_validator(mode="after")
+    def _validate_payload(self) -> ChatResponseFormat:  # noqa: D401
+        if self.type == "json_schema" and self.json_schema is None:
+            raise ValueError("response_format.json_schema is required when type='json_schema'")
+        if self.type != "json_schema" and self.json_schema is not None:
+            raise ValueError("response_format.json_schema is only allowed when type='json_schema'")
+        return self
+
+
 class ChatCompletionRequest(BaseModel):
     model: str
     messages: list[ChatMessage]
@@ -92,6 +131,7 @@ class ChatCompletionRequest(BaseModel):
     n: int = 1
     stream: bool = False
     stop: str | list[str] | None = None
+    response_format: ChatResponseFormat | None = None
     user: str | None = None
 
 
@@ -126,6 +166,144 @@ def _normalize_stop(stop: str | list[str] | None) -> list[str] | None:
     if isinstance(stop, str):
         return [stop]
     return [s for s in stop if s]
+
+
+def _effective_json_schema_strict(response_format: ChatResponseFormat) -> bool:
+    if response_format.type != "json_schema":
+        return False
+    if response_format.json_schema is not None and response_format.json_schema.strict is not None:
+        return response_format.json_schema.strict
+    return bool(response_format.strict)
+
+
+def _structured_output_system_prompt(response_format: ChatResponseFormat) -> str:
+    """Build a system instruction for OpenAI-style structured output."""
+
+    if response_format.type == "json_object":
+        return (
+            "You MUST respond with a single JSON object.\n"
+            "- Output ONLY valid JSON (no markdown, no code fences).\n"
+            "- Do not include any explanatory text.\n"
+        )
+    if response_format.type == "json_schema":
+        if response_format.json_schema is None:
+            return ""
+        schema_json = json.dumps(response_format.json_schema.schema_, ensure_ascii=False, separators=(",", ":"))
+        name = response_format.json_schema.name or "response"
+        strict = _effective_json_schema_strict(response_format)
+        strict_label = "true" if strict else "false"
+        return (
+            "You MUST respond with a single JSON value that matches the provided JSON Schema.\n"
+            "- Output ONLY valid JSON (no markdown, no code fences).\n"
+            "- Do not include any explanatory text.\n"
+            f"- schema_name: {name}\n"
+            f"- strict: {strict_label}\n"
+            f"JSON Schema: {schema_json}\n"
+        )
+    return ""
+
+
+def _inject_system_message(messages: list[dict[str, Any]], instruction: str) -> list[dict[str, Any]]:
+    """Insert a system instruction after any existing system messages."""
+
+    if not instruction:
+        return messages
+
+    prefix: list[dict[str, Any]] = []
+    idx = 0
+    while idx < len(messages) and messages[idx].get("role") == "system":
+        prefix.append(messages[idx])
+        idx += 1
+
+    return [*prefix, {"role": "system", "content": instruction}, *messages[idx:]]
+
+
+def _strip_code_fences(text: str) -> str:
+    stripped = text.strip()
+    if not stripped.startswith("```"):
+        return stripped
+
+    # Drop the opening fence line (e.g. ```json).
+    newline = stripped.find("\n")
+    if newline != -1:
+        stripped = stripped[newline + 1 :]
+
+    # Drop the trailing fence.
+    stripped = stripped.strip()
+    if stripped.endswith("```"):
+        stripped = stripped[: stripped.rfind("```")].strip()
+    return stripped
+
+
+def _extract_first_json_value(text: str) -> Any:
+    """Extract the first JSON value from text (tolerant of code fences and leading prose)."""
+
+    cleaned = _strip_code_fences(text)
+    start = next((i for i, ch in enumerate(cleaned) if ch in "{["), None)
+    if start is None:
+        raise ValueError("Model output did not contain a JSON value")
+
+    candidate = cleaned[start:]
+    decoder = json.JSONDecoder()
+    try:
+        value, _end = decoder.raw_decode(candidate)
+    except json.JSONDecodeError as exc:
+        raise ValueError(f"Invalid JSON: {exc.msg}") from exc
+    return value
+
+
+def _validate_json_schema_strict(instance: Any, schema: dict[str, Any]) -> None:
+    try:
+        jsonschema.validate(instance=instance, schema=schema)
+    except jsonschema.SchemaError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"Invalid json_schema.schema: {exc}",
+        ) from exc
+    except jsonschema.ValidationError as exc:
+        raise ValueError(f"JSON does not match schema: {exc.message}") from exc
+
+
+def _coerce_structured_output(text: str, response_format: ChatResponseFormat) -> str:
+    value = _extract_first_json_value(text)
+
+    if response_format.type == "json_object":
+        if not isinstance(value, dict):
+            raise ValueError("Expected a JSON object for response_format.type='json_object'")
+        return json.dumps(value, ensure_ascii=False, separators=(",", ":"))
+
+    if response_format.type == "json_schema":
+        if response_format.json_schema is None:
+            raise ValueError("Missing response_format.json_schema")
+        if _effective_json_schema_strict(response_format):
+            _validate_json_schema_strict(value, response_format.json_schema.schema_)
+        return json.dumps(value, ensure_ascii=False, separators=(",", ":"))
+
+    return text.strip()
+
+
+def _build_structured_output_retry_messages(
+    base_messages: list[dict[str, Any]],
+    *,
+    last_output: str,
+    error: str,
+) -> list[dict[str, Any]]:
+    error_msg = error.strip()
+    if len(error_msg) > _STRUCTURED_OUTPUT_ERROR_MAX_CHARS:
+        error_msg = f"{error_msg[:_STRUCTURED_OUTPUT_ERROR_MAX_CHARS]}..."
+
+    previous = last_output.strip()
+    if len(previous) > _STRUCTURED_OUTPUT_PREVIOUS_OUTPUT_MAX_CHARS:
+        previous = f"{previous[:_STRUCTURED_OUTPUT_PREVIOUS_OUTPUT_MAX_CHARS]}..."
+
+    return [
+        *base_messages,
+        {"role": "assistant", "content": previous},
+        {
+            "role": "user",
+            "content": (f"Your previous response was invalid. Error: {error_msg}. Return corrected JSON only."),
+        },
+    ]
 
 
 def _resolve_generation_params(
@@ -409,7 +587,7 @@ def _resolve_chat_model_and_caps(
 
 
 @router.post("/v1/chat/completions", response_model=ChatCompletionResponse)
-async def create_chat_completions(  # noqa: PLR0912
+async def create_chat_completions(  # noqa: PLR0912, PLR0915
     req: ChatCompletionRequest,
     registry: Annotated[ModelRegistry, Depends(get_model_registry)],
     _request: Request,
@@ -437,25 +615,63 @@ async def create_chat_completions(  # noqa: PLR0912
             batcher is not None and getattr(batcher, "is_supported", lambda _m: False)(req.model) and not has_images
         )
 
+        response_format = req.response_format
+        base_messages = raw_messages
+        if response_format is not None and response_format.type != "text":
+            structured_output = True
+            base_messages = _inject_system_message(raw_messages, _structured_output_system_prompt(response_format))
+        else:
+            structured_output = False
+
         if not use_batcher:
             label_token = set_queue_label(req.model or "chat")
-            limiter = vision_limiter if has_images else chat_limiter
-            async with limiter():
+
+        attempt_messages = base_messages
+        max_retries = settings.chat_structured_output_max_retries if structured_output else 0
+
+        for attempt in range(max_retries + 1):
+            if not use_batcher:
+                limiter = vision_limiter if has_images else chat_limiter
+                async with limiter():
+                    generation, prompt_tokens, max_tokens = await _run_chat_generation(
+                        req=req,
+                        registry=registry,
+                        request=_request,
+                        raw_messages=attempt_messages,
+                        has_images=has_images,
+                    )
+            else:
                 generation, prompt_tokens, max_tokens = await _run_chat_generation(
                     req=req,
                     registry=registry,
                     request=_request,
-                    raw_messages=raw_messages,
+                    raw_messages=attempt_messages,
                     has_images=has_images,
                 )
-        else:
-            generation, prompt_tokens, max_tokens = await _run_chat_generation(
-                req=req,
-                registry=registry,
-                request=_request,
-                raw_messages=raw_messages,
-                has_images=has_images,
-            )
+
+            if not structured_output:
+                break
+
+            try:
+                if response_format is None:  # pragma: no cover - defensive
+                    raise HTTPException(
+                        status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                        detail="Internal error: response_format missing",
+                    )
+                generation.text = _coerce_structured_output(generation.text, response_format)
+                break
+            except ValueError as exc:
+                if attempt >= max_retries:
+                    record_chat_request(req.model, "500")
+                    raise HTTPException(
+                        status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                        detail=f"Structured output validation failed: {exc}",
+                    ) from exc
+                attempt_messages = _build_structured_output_retry_messages(
+                    base_messages,
+                    last_output=generation.text,
+                    error=str(exc),
+                )
     except QueueFullError as exc:
         record_chat_request(req.model, "429")
         retry_after = VISION_QUEUE_TIMEOUT_SEC if has_images else CHAT_QUEUE_TIMEOUT_SEC

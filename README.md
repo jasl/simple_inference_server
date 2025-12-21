@@ -196,6 +196,10 @@ Per-model generation defaults (temperature / top_p / max_tokens) can be set in `
   - `messages` (array): OpenAI messages; supports multi-modal `image_url` parts for Qwen3-VL models
   - `max_tokens` (optional; falls back to per-model default then env `MAX_NEW_TOKENS` → 512)
   - `temperature`, `top_p`, `stop`, `user` as in OpenAI; `n` must be 1; `stream` is not yet supported
+  - `response_format` (optional): OpenAI-style structured outputs (best-effort)
+    - `{"type":"json_object"}`: server enforces valid JSON object output
+    - `{"type":"json_schema","json_schema":{"name":"...","schema":{...},"strict":true}}`: server enforces valid JSON + validates against the provided JSON Schema when `strict=true`
+    - If the model output cannot be coerced/validated after `CHAT_STRUCTURED_OUTPUT_MAX_RETRIES` retries, the request fails with a 5xx error.
   - `top_k` is intentionally unsupported for OpenAI compatibility
 - `POST /v1/audio/transcriptions`: OpenAI Whisper-compatible ASR. Multipart form fields:
   - `file` (required): audio file (e.g., wav/m4a/mp3)

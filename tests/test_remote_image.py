@@ -76,6 +76,13 @@ def test_remote_image_rejection_metric(monkeypatch: pytest.MonkeyPatch) -> None:
     get_settings.cache_clear()
     obj = QwenVLChat.__new__(QwenVLChat)
 
+    # Ensure DNS resolves to a public (non-private/non-reserved) address so the
+    # test is not dependent on the runtime environment's resolver behavior.
+    monkeypatch.setattr(
+        "socket.getaddrinfo",
+        lambda *_args, **_kwargs: [("family", "type", "proto", "canon", ("93.184.216.34", 0))],
+    )
+
     # Mock httpx client to raise size error via HEAD length
     class DummyResp:
         def __init__(self) -> None:

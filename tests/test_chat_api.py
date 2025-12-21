@@ -8,6 +8,7 @@ from app.models.base import ChatGeneration
 HTTP_OK = 200
 HTTP_BAD_REQUEST = 400
 HTTP_NOT_FOUND = 404
+HTTP_SERVER_ERROR = 500
 
 
 class DummyChatModel:
@@ -34,6 +35,28 @@ class DummyChatModel:
 
     def count_tokens(self, messages: list[dict[str, object]]) -> int:
         return 5
+
+
+class FixedResponseChatModel(DummyChatModel):
+    def __init__(self, capabilities: list[str], *, response_text: str) -> None:
+        super().__init__(capabilities)
+        self._response_text = response_text
+
+    def generate(
+        self,
+        messages: list[dict[str, object]],
+        *,
+        max_new_tokens: int,
+        temperature: float,
+        top_p: float,
+        stop: list[str] | None = None,
+    ) -> ChatGeneration:
+        return ChatGeneration(
+            text=self._response_text,
+            prompt_tokens=3,
+            completion_tokens=2,
+            finish_reason="stop",
+        )
 
 
 class DummyRegistry:
@@ -108,6 +131,116 @@ def test_image_rejected_when_model_not_vision() -> None:
         },
     )
     assert resp.status_code == HTTP_BAD_REQUEST
+
+
+def test_chat_completion_response_format_json_object_success() -> None:
+    client = TestClient(
+        create_app(
+            {
+                "dummy-chat": FixedResponseChatModel(
+                    ["chat-completion", "vision"],
+                    response_text='{"ok":true}',
+                )
+            }
+        )
+    )
+    resp = client.post(
+        "/v1/chat/completions",
+        json={
+            "model": "dummy-chat",
+            "messages": [{"role": "user", "content": "hi"}],
+            "response_format": {"type": "json_object"},
+        },
+    )
+    assert resp.status_code == HTTP_OK
+    payload = resp.json()
+    assert payload["choices"][0]["message"]["content"] == '{"ok":true}'
+
+
+def test_chat_completion_response_format_json_object_invalid_json() -> None:
+    client = TestClient(
+        create_app(
+            {
+                "dummy-chat": FixedResponseChatModel(
+                    ["chat-completion", "vision"],
+                    response_text="not json",
+                )
+            }
+        )
+    )
+    resp = client.post(
+        "/v1/chat/completions",
+        json={
+            "model": "dummy-chat",
+            "messages": [{"role": "user", "content": "hi"}],
+            "response_format": {"type": "json_object"},
+        },
+    )
+    assert resp.status_code >= HTTP_SERVER_ERROR
+
+
+def test_chat_completion_response_format_json_schema_strict_success() -> None:
+    schema = {
+        "type": "object",
+        "properties": {"answer": {"type": "string"}},
+        "required": ["answer"],
+        "additionalProperties": False,
+    }
+    client = TestClient(
+        create_app(
+            {
+                "dummy-chat": FixedResponseChatModel(
+                    ["chat-completion", "vision"],
+                    response_text='{"answer":"ok"}',
+                )
+            }
+        )
+    )
+    resp = client.post(
+        "/v1/chat/completions",
+        json={
+            "model": "dummy-chat",
+            "messages": [{"role": "user", "content": "hi"}],
+            "response_format": {
+                "type": "json_schema",
+                "json_schema": {"name": "answer", "schema": schema, "strict": True},
+            },
+        },
+    )
+    assert resp.status_code == HTTP_OK
+    payload = resp.json()
+    assert payload["choices"][0]["message"]["content"] == '{"answer":"ok"}'
+
+
+def test_chat_completion_response_format_json_schema_strict_validation_error() -> None:
+    schema = {
+        "type": "object",
+        "properties": {"answer": {"type": "string"}},
+        "required": ["answer"],
+        "additionalProperties": False,
+    }
+    client = TestClient(
+        create_app(
+            {
+                "dummy-chat": FixedResponseChatModel(
+                    ["chat-completion", "vision"],
+                    response_text='{"answer":1}',
+                )
+            }
+        )
+    )
+    resp = client.post(
+        "/v1/chat/completions",
+        json={
+            "model": "dummy-chat",
+            "messages": [{"role": "user", "content": "hi"}],
+            "response_format": {
+                "type": "json_schema",
+                "json_schema": {"name": "answer", "schema": schema, "strict": True},
+            },
+        },
+    )
+    assert resp.status_code >= HTTP_SERVER_ERROR
 
 
 PROMPT_TOKENS = 3

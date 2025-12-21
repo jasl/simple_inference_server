@@ -105,6 +105,13 @@ class Settings(BaseSettings):
     chat_oom_cooldown_sec: float = 300.0  # 5 minutes
 
     # -------------------------------------------------------------------------
+    # Chat structured outputs (OpenAI response_format)
+    # -------------------------------------------------------------------------
+    # When response_format requests JSON / JSON Schema, we can optionally retry
+    # generation a small number of times if the model outputs invalid JSON.
+    chat_structured_output_max_retries: int = 1
+
+    # -------------------------------------------------------------------------
     # Input/output limits
     # -------------------------------------------------------------------------
     max_batch_size: int = 32
