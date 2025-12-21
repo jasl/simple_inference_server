@@ -121,7 +121,8 @@ OpenAI-compatible inference API for small/edge models. Ships ready-to-run with F
 
 ## Configuration highlights
 
-- `MODELS` (required): comma-separated model IDs from `configs/model_config.yaml`.
+- `MODELS` (required): comma-separated model IDs from `configs/model_config.yaml` (plus optional local overlay; see next bullet).
+- Local model config overlay (optional): put overrides/additions in `configs/model_config.local.yaml` to avoid editing the git-tracked `configs/model_config.yaml`. Matching entries override by `name` (preferred) or `hf_repo_id`; new entries are appended.
 - `MODEL_DEVICE`: `cpu` | `mps` | `cuda` | `cuda:<idx>` | `auto` (default).
 - `AUTO_DOWNLOAD_MODELS` (default `1`): download selected models on startup; set to `0` to require pre-downloaded weights. Startup exits on download/load failure.
 - **Warmup behavior**: `ENABLE_WARMUP` (default `1`) enables a multi-capability warmup pass across embeddings / chat / vision / audio. When warmup is enabled the server **always fails fast** if any model warmup fails; use `WARMUP_ALLOWLIST` / `WARMUP_SKIPLIST` to scope coverage instead of turning off fail-fast.
@@ -342,7 +343,7 @@ All benchmark scripts accept environment overrides (e.g., `BASE_URL`, `MODEL_NAM
 ## Adding a new model
 
 1. **Implement a handler**: Create `app/models/<your_model>.py` implementing `EmbeddingModel` (see `hf_embedding.py` for reference). Set `capabilities` on the handler (e.g., `["text-embedding"]`). Use `cache_dir` pointing to `models/` (or `HF_HOME` fallback) and `local_files_only=True`.
-2. **Add config entry**: Append to `configs/model_config.yaml` with fields `name`, `hf_repo_id`, and `handler` (fully qualified import path, e.g., `app.models.my_model.MyModelEmbedding`). Keep all supported models in this file; it serves as the catalog.
+2. **Add config entry**: Add to `configs/model_config.local.yaml` (recommended for local-only changes) with fields `hf_repo_id` and `handler` (fully qualified import path, e.g., `app.models.my_model.MyModelEmbedding`; `name` is optional). If you intend to commit a new built-in model, update `configs/model_config.yaml` instead.
 3. **Select models to load at runtime**: Set `MODELS` (comma-separated) or pass `--models` to `scripts/run_dev.py`. This is required; the server will exit if not provided.
 4. **Pre-download weights**: Run `uv run python scripts/download_models.py` (requires `MODELS` set) to populate `models/`, then rebuild/restart the service. The download script honors `MODELS` to fetch only selected models. Startup will fail if any requested model cannot be loaded.
 

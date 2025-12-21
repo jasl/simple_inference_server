@@ -13,3 +13,5 @@ uv.lock.backup
 .pytest_cache
 .ruff_cache
 tmp
+configs/model_config.local.yaml
+configs/model_config.local.yml

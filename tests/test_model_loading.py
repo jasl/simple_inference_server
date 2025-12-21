@@ -41,6 +41,36 @@ def test_registry_loads_from_config(tmp_path: Path) -> None:
     assert model.capabilities == ["text-embedding"]
 
 
+def test_registry_applies_local_overlay(tmp_path: Path) -> None:
+    cfg = tmp_path / "model_config.yaml"
+    cfg.write_text(
+        textwrap.dedent(
+            """
+            models:
+              - hf_repo_id: "repo/a"
+                handler: "tests.test_model_loading.StubModel"
+                supports_structured_outputs: false
+            """
+        )
+    )
+    overlay = tmp_path / "model_config.local.yaml"
+    overlay.write_text(
+        textwrap.dedent(
+            """
+            models:
+              - hf_repo_id: "repo/a"
+                supports_structured_outputs: true
+              - hf_repo_id: "repo/b"
+                handler: "tests.test_model_loading.StubModel"
+            """
+        )
+    )
+
+    reg = registry.ModelRegistry(str(cfg), device="cpu")
+    assert set(reg.list_models()) == {"repo/a", "repo/b"}
+    assert reg.get("repo/a").supports_structured_outputs is True
+
+
 def test_registry_accepts_specific_cuda_device(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     cfg = tmp_path / "model_config.yaml"
     cfg.write_text(

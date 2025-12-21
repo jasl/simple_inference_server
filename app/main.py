@@ -12,7 +12,6 @@ from typing import Any
 
 import huggingface_hub as hf
 import torch
-import yaml
 from fastapi import FastAPI
 from huggingface_hub import snapshot_download
 
@@ -30,6 +29,7 @@ from app.concurrency.limiter import start_accepting, stop_accepting, wait_for_dr
 from app.config import settings
 from app.logging_config import setup_logging
 from app.middleware import RequestIDMiddleware
+from app.model_config import load_model_config
 from app.models.registry import ModelRegistry
 from app.monitoring.metrics import record_device_memory, setup_metrics
 from app.state import WarmupStatus
@@ -266,15 +266,14 @@ def _warn_if_accelerate_missing(config_path: str, allowlist: list[str] | None) -
     """Pre-flight warning if FP8 models are configured but accelerate is absent."""
 
     try:
-        with Path(config_path).open() as f:
-            cfg = yaml.safe_load(f) or {}
+        cfg = load_model_config(config_path)
     except Exception:  # pragma: no cover - non-critical
         return
 
     requested = set(allowlist) if allowlist else None
     fp8_models: list[str] = []
     for item in cfg.get("models", []):
-        name = item.get("name")
+        name = item.get("name") or item.get("hf_repo_id")
         if not name:
             continue
         if requested is not None and name not in requested:
@@ -353,8 +352,7 @@ def _download_models_if_enabled(config_path: str, allowlist: list[str] | None, c
         raise SystemExit("huggingface_hub is required for auto download")
 
     try:
-        with Path(config_path).open() as f:
-            cfg = yaml.safe_load(f) or {}
+        cfg = load_model_config(config_path)
     except Exception as exc:  # pragma: no cover - startup guardrail
         raise SystemExit(f"Failed to read model config at {config_path}") from exc
 

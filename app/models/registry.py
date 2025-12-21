@@ -7,9 +7,9 @@ from pathlib import Path
 from typing import Any, cast
 
 import torch
-import yaml
 
 from app.config import settings
+from app.model_config import load_model_config
 from app.models.base import ChatModel, EmbeddingModel
 from app.monitoring.metrics import record_device_memory
 from app.utils.device import resolve_device
@@ -37,8 +37,7 @@ class ModelRegistry:
         if not path_obj.exists():
             raise FileNotFoundError(f"Model config not found: {path}")
 
-        with path_obj.open() as f:
-            cfg = yaml.safe_load(f)
+        cfg = load_model_config(path_obj)
         models_cfg = cfg.get("models", [])
         if not models_cfg:
             raise ValueError("No models configured")
