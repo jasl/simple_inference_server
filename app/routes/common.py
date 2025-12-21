@@ -101,3 +101,5 @@ async def _run_work_with_client_cancel(  # noqa: D401
         raise _ClientDisconnectedError()
     finally:
         disconnect_task.cancel()
+        # Best-effort cleanup: do not block request completion on the disconnect watcher.
+        # In some test client / portal configurations, awaiting this task can deadlock.

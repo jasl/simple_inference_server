@@ -161,6 +161,7 @@ class ModelBatcher:
             self._task.cancel()
             with contextlib.suppress(asyncio.CancelledError):
                 await self._task
+            self._task = None
 
 
 class _AggregateCancel:
