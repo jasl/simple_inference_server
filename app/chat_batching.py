@@ -111,6 +111,9 @@ class ChatBatcher:
         # OOM graceful degradation state
         self._current_max_batch = max_batch
         self._oom_cooldown_until: float | None = None
+        # Optional prompt-length bucketing (reduces padding waste for heterogeneous prompts).
+        self._prompt_bucketing = bool(settings.chat_batch_prompt_bucketing)
+        self._prompt_bucket_size_tokens = int(settings.chat_batch_prompt_bucket_size_tokens)
 
     @property
     def oom_retries(self) -> int:
@@ -237,6 +240,35 @@ class ChatBatcher:
         record_chat_batch_degraded_max_size(self.model_name, self._current_max_batch)
         self._pending_requeue_cleanup = True
 
+    def _bucket_by_prompt_length(
+        self, items: list[_ChatBatchItem]
+    ) -> tuple[list[_ChatBatchItem], list[_ChatBatchItem]]:
+        """Optionally sub-bucket items by prompt length to reduce padding waste.
+
+        This is a best-effort heuristic: we pick the largest bucket and requeue
+        the rest so we retain batch size while avoiding extremely heterogeneous
+        prompt lengths in a single batch.
+        """
+
+        if not self._prompt_bucketing:
+            return items, []
+        bucket_size = self._prompt_bucket_size_tokens
+        min_bucket_items = 2
+        if bucket_size <= 0 or len(items) < min_bucket_items:
+            return items, []
+
+        buckets: dict[int, list[_ChatBatchItem]] = {}
+        for item in items:
+            prompt_tokens = int(item.prompt_tokens or 0)
+            buckets.setdefault(prompt_tokens // bucket_size, []).append(item)
+
+        best_bucket = max(buckets.values(), key=len)
+        if len(best_bucket) < min_bucket_items:
+            return items, []
+
+        leftover = [it for bucket_items in buckets.values() for it in bucket_items if it not in best_bucket]
+        return best_bucket, leftover
+
     def _prune_requeue_tasks(self, now: float, *, reason: str) -> None:
         """Cancel stale requeue attempts to avoid unbounded growth."""
 
@@ -306,6 +338,9 @@ class ChatBatcher:
                 leftover: list[_ChatBatchItem] = [
                     it for bucket in buckets.values() for it in bucket if it not in batch_items
                 ]
+                # Optional prompt-length bucketing within the compatible-config bucket.
+                batch_items, bucket_leftover = self._bucket_by_prompt_length(batch_items)
+                leftover.extend(bucket_leftover)
                 for pending in leftover:
                     self._schedule_requeue(pending)
 
