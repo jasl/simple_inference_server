@@ -1,12 +1,66 @@
 from __future__ import annotations
 
+import logging
+import queue
 import threading
 import weakref
+from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor
-from concurrent.futures.thread import _worker  # noqa: PLC2701
 from typing import Any, TypedDict, cast
 
 from app.config import settings
+
+logger = logging.getLogger(__name__)
+
+
+def _daemon_worker(
+    executor_reference: weakref.ReferenceType[ThreadPoolExecutor],
+    work_queue: Any,
+    initializer: Callable[..., Any] | None,
+    initargs: tuple[Any, ...],
+) -> None:
+    """Worker loop for `DaemonThreadPoolExecutor`.
+
+    This is a small, version-pinned copy of CPython 3.12's
+    `concurrent.futures.thread._worker`, avoiding private stdlib imports while
+    preserving behavior expected by `ThreadPoolExecutor`.
+    """
+
+    if initializer is not None:
+        try:
+            initializer(*initargs)
+        except BaseException:
+            logger.critical("Exception in ThreadPoolExecutor initializer", exc_info=True)
+            executor = executor_reference()
+            if executor is not None:
+                executor._initializer_failed()
+            return
+
+    try:
+        while True:
+            try:
+                work_item = work_queue.get_nowait()
+            except queue.Empty:
+                executor = executor_reference()
+                if executor is not None:
+                    executor._idle_semaphore.release()
+                del executor
+                work_item = work_queue.get(block=True)
+
+            if work_item is not None:
+                work_item.run()
+                del work_item
+                continue
+
+            executor = executor_reference()
+            if executor is None or executor._shutdown:
+                if executor is not None:
+                    executor._shutdown = True
+                work_queue.put(None)
+                return
+            del executor
+    except BaseException:
+        logger.critical("Exception in ThreadPoolExecutor worker", exc_info=True)
 
 
 class DaemonThreadPoolExecutor(ThreadPoolExecutor):
@@ -29,7 +83,7 @@ class DaemonThreadPoolExecutor(ThreadPoolExecutor):
             thread_name = f"{self._thread_name_prefix or self}_{num_threads}"
             t = threading.Thread(
                 name=thread_name,
-                target=_worker,
+                target=_daemon_worker,
                 args=(
                     weakref.ref(self, weakref_cb),
                     self._work_queue,
