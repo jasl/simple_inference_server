@@ -1,3 +1,5 @@
+import threading
+
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
@@ -18,7 +20,7 @@ class DummyChatModel:
         self.capabilities = capabilities
         self.supports_structured_outputs = supports_structured_outputs
 
-    def generate(
+    def generate(  # noqa: PLR0913
         self,
         messages: list[dict[str, object]],
         *,
@@ -26,6 +28,7 @@ class DummyChatModel:
         temperature: float,
         top_p: float,
         stop: list[str] | None = None,
+        cancel_event: threading.Event | None = None,
     ) -> ChatGeneration:
         return ChatGeneration(
             text="hello world",
@@ -49,7 +52,7 @@ class FixedResponseChatModel(DummyChatModel):
         super().__init__(capabilities, supports_structured_outputs=supports_structured_outputs)
         self._response_text = response_text
 
-    def generate(
+    def generate(  # noqa: PLR0913
         self,
         messages: list[dict[str, object]],
         *,
@@ -57,6 +60,7 @@ class FixedResponseChatModel(DummyChatModel):
         temperature: float,
         top_p: float,
         stop: list[str] | None = None,
+        cancel_event: threading.Event | None = None,
     ) -> ChatGeneration:
         return ChatGeneration(
             text=self._response_text,

@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import asyncio
-import inspect
 import json
 import logging
 import threading
@@ -49,6 +48,7 @@ from app.routes.common import (
     _WorkTimeoutError,
 )
 from app.threadpool import get_chat_executor, get_vision_executor
+from app.utils.executor_context import run_in_executor_with_context
 
 logger = logging.getLogger(__name__)
 router = APIRouter()
@@ -359,7 +359,8 @@ async def _prepare_chat_request(
     if hasattr(model, "prepare_inputs"):
         try:
             prepared, prompt_tokens = await asyncio.wait_for(
-                loop.run_in_executor(
+                run_in_executor_with_context(
+                    loop,
                     count_executor,
                     lambda: model.prepare_inputs(messages, add_generation_prompt=True),
                 ),
@@ -373,7 +374,7 @@ async def _prepare_chat_request(
             )
 
     prompt_tokens = await asyncio.wait_for(
-        loop.run_in_executor(count_executor, lambda: model.count_tokens(messages)),
+        run_in_executor_with_context(loop, count_executor, lambda: model.count_tokens(messages)),
         timeout=prepare_timeout,
     )
     return None, int(prompt_tokens)
@@ -408,10 +409,6 @@ async def _run_chat_generation(  # noqa: PLR0915
         )
     cancel_event = threading.Event()
     gen_timeout = settings.chat_generate_timeout_sec
-    generate_accepts_cancel = "cancel_event" in inspect.signature(model.generate).parameters
-    generate_prepared_accepts_cancel = (
-        hasattr(model, "generate_prepared") and "cancel_event" in inspect.signature(model.generate_prepared).parameters
-    )
     batcher = getattr(request.app.state, "chat_batching_service", None)
     stop = _normalize_stop(req.stop)
 
@@ -423,12 +420,9 @@ async def _run_chat_generation(  # noqa: PLR0915
                 top_p=top_p,
                 stop=stop,
                 cancel_event=cancel_event,
-                accepts_cancel=generate_prepared_accepts_cancel,
+                accepts_cancel=True,
             )
-            return await loop.run_in_executor(
-                executor,
-                lambda: model.generate_prepared(prepared_inputs, **kwargs),
-            )
+            return await run_in_executor_with_context(loop, executor, lambda: model.generate_prepared(prepared_inputs, **kwargs))
 
         kwargs = _build_generation_kwargs(
             max_tokens=max_tokens,
@@ -436,12 +430,9 @@ async def _run_chat_generation(  # noqa: PLR0915
             top_p=top_p,
             stop=stop,
             cancel_event=cancel_event,
-            accepts_cancel=generate_accepts_cancel,
+            accepts_cancel=True,
         )
-        return await loop.run_in_executor(
-            executor,
-            lambda: model.generate(raw_messages, **kwargs),
-        )
+        return await run_in_executor_with_context(loop, executor, lambda: model.generate(raw_messages, **kwargs))
 
     async def _run_batched_or_fallback() -> ChatGeneration:
         if batcher is not None and getattr(batcher, "is_supported", lambda _m: False)(req.model) and not has_images:

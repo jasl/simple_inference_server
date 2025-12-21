@@ -29,6 +29,7 @@ from app.routes.common import (
     _WorkTimeoutError,
 )
 from app.threadpool import get_embedding_executor
+from app.utils.executor_context import run_in_executor_with_context
 
 router = APIRouter()
 logger = logging.getLogger(__name__)
@@ -85,7 +86,8 @@ async def create_rerank(  # noqa: PLR0915
             # Rerank uses direct executor path (batching not implemented for rerank)
             executor = get_embedding_executor()
             loop = asyncio.get_running_loop()
-            return await loop.run_in_executor(
+            return await run_in_executor_with_context(
+                loop,
                 executor,
                 lambda: model.rerank(req.query, req.documents, top_k=req.top_n, cancel_event=cancel_event),
             )

@@ -38,6 +38,7 @@ from app.routes.common import (
     _WorkTimeoutError,
 )
 from app.threadpool import get_embedding_count_executor, get_embedding_executor
+from app.utils.executor_context import run_in_executor_with_context
 
 logger = logging.getLogger(__name__)
 router = APIRouter()
@@ -101,7 +102,8 @@ async def _build_embedding_usage(model: Any, texts: list[str]) -> Usage:
     else:
         try:
             loop = asyncio.get_running_loop()
-            prompt_tokens = await loop.run_in_executor(
+            prompt_tokens = await run_in_executor_with_context(
+                loop,
                 get_embedding_count_executor(),
                 lambda: model.count_tokens(texts),
             )
@@ -137,7 +139,8 @@ async def _run_embedding_generation(  # noqa: PLR0913 - explicit kwargs for clar
         else:
             executor = get_embedding_executor()
             work_task = asyncio.ensure_future(
-                loop.run_in_executor(
+                run_in_executor_with_context(
+                    loop,
                     executor,
                     lambda: model.embed(texts, cancel_event=cancel_event),
                 )
