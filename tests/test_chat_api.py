@@ -12,10 +12,11 @@ HTTP_SERVER_ERROR = 500
 
 
 class DummyChatModel:
-    def __init__(self, capabilities: list[str]) -> None:
+    def __init__(self, capabilities: list[str], *, supports_structured_outputs: bool = False) -> None:
         self.name = "dummy-chat"
         self.device = "cpu"
         self.capabilities = capabilities
+        self.supports_structured_outputs = supports_structured_outputs
 
     def generate(
         self,
@@ -38,8 +39,14 @@ class DummyChatModel:
 
 
 class FixedResponseChatModel(DummyChatModel):
-    def __init__(self, capabilities: list[str], *, response_text: str) -> None:
-        super().__init__(capabilities)
+    def __init__(
+        self,
+        capabilities: list[str],
+        *,
+        response_text: str,
+        supports_structured_outputs: bool = False,
+    ) -> None:
+        super().__init__(capabilities, supports_structured_outputs=supports_structured_outputs)
         self._response_text = response_text
 
     def generate(
@@ -133,6 +140,22 @@ def test_image_rejected_when_model_not_vision() -> None:
     assert resp.status_code == HTTP_BAD_REQUEST
 
 
+def test_chat_completion_response_format_rejected_when_model_not_supports_structured_outputs() -> None:
+    client = TestClient(
+        create_app({"dummy-chat": DummyChatModel(["chat-completion", "vision"], supports_structured_outputs=False)})
+    )
+    resp = client.post(
+        "/v1/chat/completions",
+        json={
+            "model": "dummy-chat",
+            "messages": [{"role": "user", "content": "hi"}],
+            "response_format": {"type": "json_object"},
+        },
+    )
+    assert resp.status_code == HTTP_BAD_REQUEST
+    assert "does not support response_format" in resp.json()["detail"]
+
+
 def test_chat_completion_response_format_json_object_success() -> None:
     client = TestClient(
         create_app(
@@ -140,6 +163,7 @@ def test_chat_completion_response_format_json_object_success() -> None:
                 "dummy-chat": FixedResponseChatModel(
                     ["chat-completion", "vision"],
                     response_text='{"ok":true}',
+                    supports_structured_outputs=True,
                 )
             }
         )
@@ -164,6 +188,7 @@ def test_chat_completion_response_format_json_object_invalid_json() -> None:
                 "dummy-chat": FixedResponseChatModel(
                     ["chat-completion", "vision"],
                     response_text="not json",
+                    supports_structured_outputs=True,
                 )
             }
         )
@@ -192,6 +217,7 @@ def test_chat_completion_response_format_json_schema_strict_success() -> None:
                 "dummy-chat": FixedResponseChatModel(
                     ["chat-completion", "vision"],
                     response_text='{"answer":"ok"}',
+                    supports_structured_outputs=True,
                 )
             }
         )
@@ -225,6 +251,7 @@ def test_chat_completion_response_format_json_schema_strict_validation_error() -
                 "dummy-chat": FixedResponseChatModel(
                     ["chat-completion", "vision"],
                     response_text='{"answer":1}',
+                    supports_structured_outputs=True,
                 )
             }
         )

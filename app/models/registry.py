@@ -52,6 +52,7 @@ class ModelRegistry:
                 continue
             handler_path = item.get("handler")
             gen_defaults = item.get("defaults") or {}
+            supports_structured_outputs = bool(item.get("supports_structured_outputs", False))
             if "fp8" in str(repo).lower() and not self._has_fp8_hardware():
                 raise RuntimeError(
                     f"Model '{name}' uses FP8 weights but no CUDA/XPU device is available. "
@@ -63,6 +64,9 @@ class ModelRegistry:
             handler_factory = self._import_handler(handler_path)
 
             model = handler_factory(repo, self.device)
+            # Feature gates (config-driven). These are read by routes to decide
+            # whether to accept certain OpenAI-compatible request parameters.
+            cast(Any, model).supports_structured_outputs = supports_structured_outputs
             # Optional per-model generation defaults (e.g., temperature, top_p, max_tokens) for chat-capable models only.
             if gen_defaults and "chat-completion" in getattr(model, "capabilities", []):
                 cast(Any, model).generation_defaults = gen_defaults

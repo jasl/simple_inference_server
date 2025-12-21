@@ -126,6 +126,7 @@ OpenAI-compatible inference API for small/edge models. Ships ready-to-run with F
 - `AUTO_DOWNLOAD_MODELS` (default `1`): download selected models on startup; set to `0` to require pre-downloaded weights. Startup exits on download/load failure.
 - **Warmup behavior**: `ENABLE_WARMUP` (default `1`) enables a multi-capability warmup pass across embeddings / chat / vision / audio. When warmup is enabled the server **always fails fast** if any model warmup fails; use `WARMUP_ALLOWLIST` / `WARMUP_SKIPLIST` to scope coverage instead of turning off fail-fast.
 - Chat generation defaults: per-model `defaults` (temperature/top_p/max_tokens) in the config; request args override.
+- Chat structured outputs gate: per-model `supports_structured_outputs` in `configs/model_config.yaml` must be `true` to accept `response_format` requests (non-`text`).
 - Embedding batching queue: `EMBEDDING_BATCH_QUEUE_SIZE` (default `64`, falls back to `MAX_QUEUE_SIZE`) bounds the per-model micro-batch queue to prevent unbounded RAM growth.
 - Audio path isolation: `AUDIO_MAX_CONCURRENT` / `AUDIO_MAX_QUEUE_SIZE` / `AUDIO_QUEUE_TIMEOUT_SEC` plus `AUDIO_MAX_WORKERS` size a dedicated limiter + thread pool for Whisper so it will not block chat/embedding traffic; default worker count is **1** and Whisper currently serializes work with a lock, so bumping workers only helps if you fork per-worker pipelines.
   - Handlers must be thread-safe if `AUDIO_MAX_WORKERS` > 1; otherwise wrap shared state with locks (Whisper handler already guards its pipeline but still serializes by default).
@@ -157,29 +158,29 @@ OpenAI-compatible inference API for small/edge models. Ships ready-to-run with F
 
 All supported models are defined in `configs/model_config.yaml` (kept as the catalog). Pick which ones to load at runtime via `MODELS` / `--models`.
 
-| id (`model` param) | HF repo | Handler |
-| --- | --- | --- |
-| `BAAI/bge-m3` | `BAAI/bge-m3` | `app.models.hf_embedding.HFEmbeddingModel` |
-| `google/embeddinggemma-300m` | `google/embeddinggemma-300m` | `app.models.hf_embedding.HFEmbeddingModel` |
-| `Qwen/Qwen3-VL-4B-Instruct-FP8` | `Qwen/Qwen3-VL-4B-Instruct-FP8` | `app.models.qwen_vl.QwenVLChat` |
-| `Qwen/Qwen3-VL-2B-Instruct-FP8` | `Qwen/Qwen3-VL-2B-Instruct-FP8` | `app.models.qwen_vl.QwenVLChat` |
-| `Qwen/Qwen3-VL-4B-Instruct` | `Qwen/Qwen3-VL-4B-Instruct` | `app.models.qwen_vl.QwenVLChat` |
-| `Qwen/Qwen3-VL-2B-Instruct` | `Qwen/Qwen3-VL-2B-Instruct` | `app.models.qwen_vl.QwenVLChat` |
-| `Qwen/Qwen3-4B-Instruct-2507` | `Qwen/Qwen3-4B-Instruct-2507` | `app.models.text_chat.TextChatModel` |
-| `Qwen/Qwen3-4B-Instruct-2507-FP8` | `Qwen/Qwen3-4B-Instruct-2507-FP8` | `app.models.text_chat.TextChatModel` |
-| `meta-llama/Llama-3.2-1B-Instruct` | `meta-llama/Llama-3.2-1B-Instruct` | `app.models.text_chat.TextChatModel` |
-| `meta-llama/Llama-3.2-3B-Instruct` | `meta-llama/Llama-3.2-3B-Instruct` | `app.models.text_chat.TextChatModel` |
-| `jethrowang/whisper-tiny-chinese` | `jethrowang/whisper-tiny-chinese` | `app.models.whisper.WhisperASR` |
-| `Ivydata/whisper-small-japanese` | `Ivydata/whisper-small-japanese` | `app.models.whisper.WhisperASR` |
-| `BELLE-2/Belle-whisper-large-v3-zh` | `BELLE-2/Belle-whisper-large-v3-zh` | `app.models.whisper.WhisperASR` |
-| `whisper-large-v3-japanese-4k-steps` | `whisper-large-v3-japanese-4k-steps` | `app.models.whisper.WhisperASR` |
-| `openai/whisper-large-v2` | `openai/whisper-large-v2` | `app.models.whisper.WhisperASR` |
-| `openai/whisper-medium` | `openai/whisper-medium` | `app.models.whisper.WhisperASR` |
-| `openai/whisper-medium.en` | `openai/whisper-medium.en` | `app.models.whisper.WhisperASR` |
-| `openai/whisper-small` | `openai/whisper-small` | `app.models.whisper.WhisperASR` |
-| `openai/whisper-small.en` | `openai/whisper-small.en` | `app.models.whisper.WhisperASR` |
-| `openai/whisper-tiny` | `openai/whisper-tiny` | `app.models.whisper.WhisperASR` |
-| `openai/whisper-tiny.en` | `openai/whisper-tiny.en` | `app.models.whisper.WhisperASR` |
+| id (`model` param) | HF repo | Handler | `supports_structured_outputs` |
+| --- | --- | --- | --- |
+| `BAAI/bge-m3` | `BAAI/bge-m3` | `app.models.hf_embedding.HFEmbeddingModel` | n/a |
+| `google/embeddinggemma-300m` | `google/embeddinggemma-300m` | `app.models.hf_embedding.HFEmbeddingModel` | n/a |
+| `Qwen/Qwen3-VL-4B-Instruct-FP8` | `Qwen/Qwen3-VL-4B-Instruct-FP8` | `app.models.qwen_vl.QwenVLChat` | false |
+| `Qwen/Qwen3-VL-2B-Instruct-FP8` | `Qwen/Qwen3-VL-2B-Instruct-FP8` | `app.models.qwen_vl.QwenVLChat` | false |
+| `Qwen/Qwen3-VL-4B-Instruct` | `Qwen/Qwen3-VL-4B-Instruct` | `app.models.qwen_vl.QwenVLChat` | false |
+| `Qwen/Qwen3-VL-2B-Instruct` | `Qwen/Qwen3-VL-2B-Instruct` | `app.models.qwen_vl.QwenVLChat` | false |
+| `Qwen/Qwen3-4B-Instruct-2507` | `Qwen/Qwen3-4B-Instruct-2507` | `app.models.text_chat.TextChatModel` | false |
+| `Qwen/Qwen3-4B-Instruct-2507-FP8` | `Qwen/Qwen3-4B-Instruct-2507-FP8` | `app.models.text_chat.TextChatModel` | false |
+| `meta-llama/Llama-3.2-1B-Instruct` | `meta-llama/Llama-3.2-1B-Instruct` | `app.models.text_chat.TextChatModel` | false |
+| `meta-llama/Llama-3.2-3B-Instruct` | `meta-llama/Llama-3.2-3B-Instruct` | `app.models.text_chat.TextChatModel` | false |
+| `jethrowang/whisper-tiny-chinese` | `jethrowang/whisper-tiny-chinese` | `app.models.whisper.WhisperASR` | n/a |
+| `Ivydata/whisper-small-japanese` | `Ivydata/whisper-small-japanese` | `app.models.whisper.WhisperASR` | n/a |
+| `BELLE-2/Belle-whisper-large-v3-zh` | `BELLE-2/Belle-whisper-large-v3-zh` | `app.models.whisper.WhisperASR` | n/a |
+| `whisper-large-v3-japanese-4k-steps` | `whisper-large-v3-japanese-4k-steps` | `app.models.whisper.WhisperASR` | n/a |
+| `openai/whisper-large-v2` | `openai/whisper-large-v2` | `app.models.whisper.WhisperASR` | n/a |
+| `openai/whisper-medium` | `openai/whisper-medium` | `app.models.whisper.WhisperASR` | n/a |
+| `openai/whisper-medium.en` | `openai/whisper-medium.en` | `app.models.whisper.WhisperASR` | n/a |
+| `openai/whisper-small` | `openai/whisper-small` | `app.models.whisper.WhisperASR` | n/a |
+| `openai/whisper-small.en` | `openai/whisper-small.en` | `app.models.whisper.WhisperASR` | n/a |
+| `openai/whisper-tiny` | `openai/whisper-tiny` | `app.models.whisper.WhisperASR` | n/a |
+| `openai/whisper-tiny.en` | `openai/whisper-tiny.en` | `app.models.whisper.WhisperASR` | n/a |
 
 FP8 Qwen3-VL models require `accelerate` (added to dependencies). If you prefer non-quantized weights, swap the repos to `Qwen/Qwen3-VL-4B-Instruct` or `Qwen/Qwen3-VL-2B-Instruct` in `configs/model_config.yaml`; all other logic remains the same.
 
@@ -196,7 +197,8 @@ Per-model generation defaults (temperature / top_p / max_tokens) can be set in `
   - `messages` (array): OpenAI messages; supports multi-modal `image_url` parts for Qwen3-VL models
   - `max_tokens` (optional; falls back to per-model default then env `MAX_NEW_TOKENS` → 512)
   - `temperature`, `top_p`, `stop`, `user` as in OpenAI; `n` must be 1; `stream` is not yet supported
-  - `response_format` (optional): OpenAI-style structured outputs (best-effort)
+  - `response_format` (optional): OpenAI-style structured outputs (gated per model; best-effort)
+    - Requires `supports_structured_outputs: true` for the selected model in `configs/model_config.yaml` (otherwise 400).
     - `{"type":"json_object"}`: server enforces valid JSON object output
     - `{"type":"json_schema","json_schema":{"name":"...","schema":{...},"strict":true}}`: server enforces valid JSON + validates against the provided JSON Schema when `strict=true`
     - If the model output cannot be coerced/validated after `CHAT_STRUCTURED_OUTPUT_MAX_RETRIES` retries, the request fails with a 5xx error.

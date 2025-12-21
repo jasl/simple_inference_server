@@ -609,6 +609,7 @@ async def create_chat_completions(  # noqa: PLR0912, PLR0915
     try:
         raw_messages = [msg.model_dump(mode="python") for msg in req.messages]
         has_images = _contains_image_content(raw_messages)
+        model = _resolve_chat_model_and_caps(registry, req.model, has_images=has_images)
 
         batcher = getattr(_request.app.state, "chat_batching_service", None)
         use_batcher = bool(
@@ -616,6 +617,19 @@ async def create_chat_completions(  # noqa: PLR0912, PLR0915
         )
 
         response_format = req.response_format
+        if (
+            response_format is not None
+            and response_format.type != "text"
+            and not getattr(model, "supports_structured_outputs", False)
+        ):
+            record_chat_request(req.model, "400")
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail=(
+                    f"Model {req.model} does not support response_format structured outputs. "
+                    "Enable supports_structured_outputs: true for this model in configs/model_config.yaml."
+                ),
+            )
         base_messages = raw_messages
         if response_format is not None and response_format.type != "text":
             structured_output = True
