@@ -33,6 +33,11 @@ logger = logging.getLogger(__name__)
 class TextChatModel(ChatModel):
     """Generic text-only chat handler using HF chat template."""
 
+    # Per-handler concurrency cap. Even if the shared chat executor has multiple
+    # workers, keep at most one in-flight generation per model instance unless
+    # proven safe under parallel `generate()` calls.
+    max_parallelism = 1
+
     def __init__(self, hf_repo_id: str, device: str = "auto") -> None:
         self.name = hf_repo_id
         self.capabilities = ["chat-completion"]

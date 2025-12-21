@@ -36,7 +36,7 @@ from app.routes.common import (
     _WorkTimeoutError,
 )
 from app.threadpool import get_audio_executor
-from app.utils.executor_context import run_in_executor_with_context
+from app.utils.executor_context import run_in_executor_with_context, run_in_executor_with_context_limited
 from app.utils.uploads import chunked_upload_to_tempfile
 
 router = APIRouter()
@@ -217,8 +217,8 @@ async def _execute_transcription(  # noqa: PLR0913
     loop = asyncio.get_running_loop()
     executor = get_audio_executor()
 
-    work_task: asyncio.Future[Any] = asyncio.ensure_future(
-        run_in_executor_with_context(
+    async def _run_transcribe() -> Any:
+        return await run_in_executor_with_context_limited(
             loop,
             executor,
             lambda: model.transcribe(
@@ -230,8 +230,10 @@ async def _execute_transcription(  # noqa: PLR0913
                 timestamp_granularity=granularity if need_segments else None,
                 cancel_event=cancel_event,
             ),
-        ),
-    )
+            model=model,
+        )
+
+    work_task: asyncio.Future[Any] = asyncio.ensure_future(_run_transcribe())
     try:
         return await _run_work_with_client_cancel(
             request=request,

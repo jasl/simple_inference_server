@@ -22,6 +22,12 @@ if TYPE_CHECKING:
 #     (e.g., tokenizers, pipelines, HTTP clients) via its own locks. The server
 #     will continue to use the shared executors but may log warnings when the
 #     worker count for that capability is >1 to highlight potential inefficiency.
+#
+# Handlers may also expose `max_parallelism: int | None`:
+#   - None / missing: no extra per-model cap beyond the normal limiters/executors.
+#   - 1 (or any positive int): the API layer will cap in-flight calls into that
+#     handler instance on non-batched paths. This is useful when a handler uses
+#     internal locks or otherwise doesn't benefit from parallel calls.
 
 
 class EmbeddingModel(Protocol):

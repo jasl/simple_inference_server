@@ -37,6 +37,10 @@ logger = logging.getLogger(__name__)
 class QwenVLChat(ChatModel):
     """Chat handler for Qwen3-VL models with OpenAI-compatible inputs."""
 
+    # This handler serializes processor/model interactions via `_gen_lock`.
+    # Cap in-flight calls at 1 to avoid wasting executor threads waiting on the lock.
+    max_parallelism = 1
+
     def __init__(self, hf_repo_id: str, device: str = "auto") -> None:
         self.name = hf_repo_id
         self.capabilities = ["chat-completion", "vision"]

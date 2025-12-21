@@ -33,6 +33,10 @@ logger = logging.getLogger(__name__)
 class WhisperASR(SpeechModel):
     """Whisper speech-to-text handler with OpenAI-style behavior."""
 
+    # The handler internally serializes pipeline access; avoid scheduling multiple
+    # concurrent transcribes which would otherwise occupy executor threads waiting.
+    max_parallelism = 1
+
     def __init__(self, hf_repo_id: str, device: str = "auto") -> None:
         self.hf_repo_id = hf_repo_id
         self.name = hf_repo_id  # expose repo id for clarity in logs/metrics
