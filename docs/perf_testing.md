@@ -1,8 +1,61 @@
-## Performance Testing & Monitoring Guide
+# Performance Testing & Tuning Guide
+
+This document covers performance tuning, load testing, and monitoring for Simple Inference Server.
+
+## Quick Tuning Checklist
+
+Before diving into detailed load testing, use this checklist to configure your deployment:
+
+### Concurrency Gate
+
+- **`MAX_CONCURRENT`** caps how many requests may run model forward passes simultaneously
+- Per-capability worker counts (`EMBEDDING_MAX_WORKERS`, `CHAT_MAX_WORKERS`, etc.) size thread pools but do **not** bypass the limiter
+- Keep each `*_MAX_WORKERS` ≤ `MAX_CONCURRENT` to avoid oversubscribing CPU/GPU threads
+- On a single GPU/MPS, start with `MAX_CONCURRENT=1–2` and tune batching instead of raising concurrency
+
+### Micro-Batching
+
+- Keep `ENABLE_EMBEDDING_BATCHING=1`; tune `EMBEDDING_BATCH_WINDOW_MS` (4–10 ms) and `EMBEDDING_BATCH_WINDOW_MAX_SIZE` (8–16)
+- For chat: `ENABLE_CHAT_BATCHING=1`; tune `CHAT_BATCH_WINDOW_MS` (4–10 ms) and `CHAT_BATCH_MAX_SIZE` (4–8)
+- Enable `CHAT_BATCH_PROMPT_BUCKETING=1` to reduce padding waste for heterogeneous prompts
+
+### Queueing
+
+- `MAX_QUEUE_SIZE` controls waiting requests; too large increases tail latency, too small yields 429s
+- Set per your SLA requirements
+
+### Warmup
+
+- Keep `ENABLE_WARMUP=1` for production deployments
+- For heavier models, raise `WARMUP_STEPS` (2–3) and `WARMUP_BATCH_SIZE` (4–8)
+- Use `WARMUP_VRAM_BUDGET_MB` / `WARMUP_VRAM_PER_WORKER_MB` to bound warmup on tighter GPUs
+
+### Device Selection
+
+- Set `MODEL_DEVICE` to `cuda`, `cuda:<idx>`, `mps`, or `cpu`
+- On macOS MPS, performance varies with temperature/power
+
+### Input Guards
+
+- `MAX_BATCH_SIZE` and `MAX_TEXT_CHARS` protect the API from oversized requests
+- `MAX_AUDIO_BYTES` (default 25MB) limits Whisper upload size
+
+### GPU Tuning Examples
+
+| Scenario | Configuration |
+|----------|---------------|
+| **Single RTX-class GPU** | `MODEL_DEVICE=cuda`, `MAX_CONCURRENT=1`, `EMBEDDING_BATCH_WINDOW_MS=4–6`, `EMBEDDING_BATCH_WINDOW_MAX_SIZE=16`, `MAX_QUEUE_SIZE=128`, `ENABLE_WARMUP=1` |
+| **Multi-GPU** | Pin with `CUDA_VISIBLE_DEVICES`, run one replica per GPU, keep `MAX_CONCURRENT=1–2` per replica |
+| **Latency-sensitive** | `EMBEDDING_BATCH_WINDOW_MS=0` (disable coalescing), `MAX_CONCURRENT=1` |
+| **CPU-only edge** | `MODEL_DEVICE=cpu`, `MAX_CONCURRENT=1`, `EMBEDDING_MAX_WORKERS=1–2`, `CHAT_MAX_WORKERS=1–2`, `AUDIO_MAX_CONCURRENT=1` |
+
+---
+
+## Load Testing Guide
 
 ### Overview
 
-This document provides guidance for high-concurrency load testing and monitoring of Simple Inference Server. Main objectives:
+This section provides guidance for high-concurrency load testing and monitoring. Main objectives:
 
 - Verify **throughput, latency, and error rates** for embeddings / chat / audio under high concurrency on the target hardware.
 - Use `/metrics` and `/health` to observe **rate limiting/queuing, batching, caching, and warmup** status.
