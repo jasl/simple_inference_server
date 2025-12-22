@@ -146,6 +146,11 @@ class _StoppingCriteriaList(list):  # pragma: no cover - stub type only
 class _DummyTokenizer:  # pragma: no cover - stub type only
     pad_token_id: int | None = 0
     eos_token_id: int | None = 0
+    padding_side: str = "right"
+
+    @classmethod
+    def from_pretrained(cls, *args: Any, **kwargs: Any) -> _DummyTokenizer:
+        return cls()
 
     def encode(self, _text: Any, add_special_tokens: bool = False) -> list[int]:
         return []
@@ -189,6 +194,7 @@ class _DummyModel:  # pragma: no cover - stub type only
 
 
 _transformers.AutoModelForCausalLM = _DummyModel
+_transformers.AutoModel = _DummyModel
 _transformers.AutoProcessor = _DummyProcessor
 _transformers.AutoTokenizer = _DummyTokenizer
 _transformers.StoppingCriteria = _StoppingCriteria

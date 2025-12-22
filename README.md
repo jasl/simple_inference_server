@@ -161,6 +161,8 @@ All supported models are defined in `models.yaml` (kept as the catalog). Pick wh
 | --- | --- | --- | --- |
 | `BAAI/bge-m3` | `BAAI/bge-m3` | `app.models.hf_embedding.HFEmbeddingModel` | n/a |
 | `google/embeddinggemma-300m` | `google/embeddinggemma-300m` | `app.models.hf_embedding.HFEmbeddingModel` | n/a |
+| `Qwen/Qwen3-Embedding-0.6B` | `Qwen/Qwen3-Embedding-0.6B` | `app.models.hf_embedding.HFEmbeddingModel` | n/a |
+| `Qwen/Qwen3-Embedding-4B` | `Qwen/Qwen3-Embedding-4B` | `app.models.hf_embedding.HFEmbeddingModel` | n/a |
 | `Qwen/Qwen3-VL-4B-Instruct-FP8` | `Qwen/Qwen3-VL-4B-Instruct-FP8` | `app.models.qwen_vl.QwenVLChat` | false |
 | `Qwen/Qwen3-VL-2B-Instruct-FP8` | `Qwen/Qwen3-VL-2B-Instruct-FP8` | `app.models.qwen_vl.QwenVLChat` | false |
 | `Qwen/Qwen3-VL-4B-Instruct` | `Qwen/Qwen3-VL-4B-Instruct` | `app.models.qwen_vl.QwenVLChat` | false |
