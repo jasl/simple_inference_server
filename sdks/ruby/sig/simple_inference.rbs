@@ -1,4 +1,0 @@
-module SimpleInference
-  VERSION: String
-end
-

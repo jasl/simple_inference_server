@@ -147,18 +147,3 @@ Common responses:
 
 - `GET /v1/models` returns `owned_by` (`local` / `openai` / `vllm`)
 - Logs: `chat_proxy_request` and `embedding_proxy_request` record upstream type, status code, and latency
-
-## Ruby SDK usage (optional)
-
-With the Ruby SDK, simply point `base_url` to this service and set `model` to the proxy model’s `name`.
-
-Streaming example (proxy models will use SSE; local models will automatically fall back to non-streaming in the SDK):
-
-```ruby
-client.chat_completions_stream(
-  model: "proxy-chat",
-  messages: [{ "role" => "user", "content" => "hi" }]
-) do |event|
-  # event is the parsed SSE JSON chunk
-end
-```
