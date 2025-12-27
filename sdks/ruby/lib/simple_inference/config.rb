@@ -4,6 +4,7 @@ module SimpleInference
   class Config
     attr_reader :base_url,
                 :api_key,
+                :api_prefix,
                 :timeout,
                 :open_timeout,
                 :read_timeout,
@@ -18,6 +19,10 @@ module SimpleInference
       )
       @api_key = (opts[:api_key] || ENV["SIMPLE_INFERENCE_API_KEY"]).to_s
       @api_key = nil if @api_key.empty?
+
+      @api_prefix = normalize_api_prefix(
+        opts.key?(:api_prefix) ? opts[:api_prefix] : ENV.fetch("SIMPLE_INFERENCE_API_PREFIX", "/v1")
+      )
 
       @timeout = to_float_or_nil(opts[:timeout] || ENV["SIMPLE_INFERENCE_TIMEOUT"])
       @open_timeout = to_float_or_nil(opts[:open_timeout] || ENV["SIMPLE_INFERENCE_OPEN_TIMEOUT"])
@@ -44,6 +49,17 @@ module SimpleInference
       url = value.to_s.strip
       url = "http://localhost:8000" if url.empty?
       url.chomp("/")
+    end
+
+    def normalize_api_prefix(value)
+      return "" if value.nil?
+
+      prefix = value.to_s.strip
+      return "" if prefix.empty?
+
+      # Ensure it starts with / and does not end with /
+      prefix = "/#{prefix}" unless prefix.start_with?("/")
+      prefix.chomp("/")
     end
 
     def to_float_or_nil(value)

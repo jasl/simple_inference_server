@@ -1,13 +1,24 @@
-## simple_inference Ruby SDK
+# SimpleInference
 
-Fiber-friendly Ruby client for the Simple Inference Server APIs (chat, embeddings, audio, rerank, health), designed to work well inside Rails apps and background jobs.
+A lightweight, Fiber-friendly Ruby client for OpenAI-compatible LLM APIs. Works seamlessly with OpenAI, Azure OpenAI, 火山引擎 (Volcengine), DeepSeek, Groq, Together AI, and any other provider that implements the OpenAI API specification.
 
-### Installation
+Designed for simplicity and compatibility – no heavy dependencies, just pure Ruby with `Net::HTTP`.
 
-Add the gem to your Rails application's `Gemfile`, pointing at this repository path:
+## Features
+
+- 🔌 **Universal compatibility** – Works with any OpenAI-compatible API provider
+- 🌊 **Streaming support** – Native SSE streaming for chat completions
+- 🧵 **Fiber-friendly** – Compatible with Ruby 3 Fiber scheduler, works great with Falcon
+- 🔧 **Flexible configuration** – Customizable API prefix for non-standard endpoints
+- 🎯 **Simple interface** – Receive-an-Object / Return-an-Object style API
+- 📦 **Zero runtime dependencies** – Uses only Ruby standard library
+
+## Installation
+
+Add to your Gemfile:
 
 ```ruby
-gem "simple_inference", path: "sdks/ruby"
+gem "simple_inference"
 ```
 
 Then run:
@@ -16,173 +27,151 @@ Then run:
 bundle install
 ```
 
-### Configuration
-
-You can configure the client via environment variables:
-
-- `SIMPLE_INFERENCE_BASE_URL`: e.g. `http://localhost:8000`
-- `SIMPLE_INFERENCE_API_KEY`: optional, if your deployment requires auth (sent as `Authorization: Bearer <token>`).
-- `SIMPLE_INFERENCE_TIMEOUT`, `SIMPLE_INFERENCE_OPEN_TIMEOUT`, `SIMPLE_INFERENCE_READ_TIMEOUT` (seconds).
-- `SIMPLE_INFERENCE_RAISE_ON_ERROR`: `true`/`false` (default `true`).
-
-Or explicitly when constructing a client:
+## Quick Start
 
 ```ruby
+require "simple_inference"
+
+# Connect to OpenAI
 client = SimpleInference::Client.new(
-  base_url: "http://localhost:8000",
-  api_key:  ENV["SIMPLE_INFERENCE_API_KEY"],
-  timeout:  30.0
-)
-```
-
-For convenience, you can also use the module constructor:
-
-```ruby
-client = SimpleInference.new(base_url: "http://localhost:8000")
-```
-
-### Rails integration example
-
-Create an initializer, for example `config/initializers/simple_inference.rb`:
-
-```ruby
-SIMPLE_INFERENCE_CLIENT = SimpleInference::Client.new(
-  base_url: ENV.fetch("SIMPLE_INFERENCE_BASE_URL", "http://localhost:8000"),
-  api_key:  ENV["SIMPLE_INFERENCE_API_KEY"]
-)
-```
-
-Then in a controller:
-
-```ruby
-class ChatsController < ApplicationController
-  def create
-    result = SIMPLE_INFERENCE_CLIENT.chat_completions(
-      model:    "local-llm",
-      messages: [
-        { "role" => "user", "content" => params[:prompt] }
-      ]
-    )
-
-    render json: result[:body], status: result[:status]
-  end
-end
-```
-
-You can also use the client in background jobs:
-
-```ruby
-class EmbedJob < ApplicationJob
-  queue_as :default
-
-  def perform(text)
-    result = SIMPLE_INFERENCE_CLIENT.embeddings(
-      model: "bge-m3",
-      input: text
-    )
-
-    vector = result[:body]["data"].first["embedding"]
-    # TODO: persist the vector (e.g. in DB or a vector store)
-  end
-end
-```
-
-And for health checks / maintenance tasks:
-
-```ruby
-if SIMPLE_INFERENCE_CLIENT.healthy?
-  Rails.logger.info("Inference server is healthy")
-else
-  Rails.logger.warn("Inference server is unhealthy")
-end
-
-models = SIMPLE_INFERENCE_CLIENT.list_models
-Rails.logger.info("Available models: #{models[:body].inspect}")
-```
-
-### Using upstream proxy models (vLLM / OpenAI)
-
-If your Simple Inference Server is configured with **upstream proxy models** (so it forwards certain `model` IDs to vLLM/OpenAI), the Ruby SDK usage is unchanged:
-
-- Use the gateway as the single `base_url`.
-- Set `model:` to the proxy model name (the `name` in `models.local.yaml` / `models.local.yml`).
-- If the upstream supports streaming, `chat_completions_stream` will stream SSE events end-to-end through the gateway.
-
-### API methods
-
-- `client.chat_completions(params)` → `POST /v1/chat/completions`
-- `client.embeddings(params)` → `POST /v1/embeddings`
-- `client.rerank(params)` → `POST /v1/rerank`
-- `client.list_models` → `GET /v1/models`
-- `client.health` → `GET /health`
-- `client.healthy?` → boolean helper based on `/health`
-- `client.audio_transcriptions(params)` → `POST /v1/audio/transcriptions`
-- `client.audio_translations(params)` → `POST /v1/audio/translations`
-
-All methods follow a Receive-an-Object / Return-an-Object style:
-
-- Input: a Ruby `Hash` (keys can be strings or symbols).
-- Output: a `Hash` with keys:
-  - `:status` – HTTP status code
-  - `:headers` – response headers (lowercased keys)
-  - `:body` – parsed JSON (Ruby `Hash`) when the response is JSON, or a `String` for text bodies.
-
-### Error handling
-
-By default (`raise_on_error: true`) non-2xx HTTP responses raise:
-
-- `SimpleInference::Errors::HTTPError` – wraps status, headers and raw body.
-
-Network and parsing errors are mapped to:
-
-- `SimpleInference::Errors::TimeoutError`
-- `SimpleInference::Errors::ConnectionError`
-- `SimpleInference::Errors::DecodeError`
-
-If you prefer to handle HTTP error codes manually, disable raising:
-
-```ruby
-client = SimpleInference::Client.new(
-  base_url: "http://localhost:8000",
-  raise_on_error: false
+  base_url: "https://api.openai.com",
+  api_key: ENV["OPENAI_API_KEY"]
 )
 
-response = client.embeddings(model: "local-embed", input: "hello")
-if response[:status] == 200
-  # happy path
-else
-  Rails.logger.warn("Embedding call failed: #{response[:status]} #{response[:body].inspect}")
-end
+response = client.chat_completions(
+  model: "gpt-4o-mini",
+  messages: [{ "role" => "user", "content" => "Hello!" }]
+)
+
+puts response[:body]["choices"][0]["message"]["content"]
 ```
 
-### Using with OpenAI and compatible services
+## Configuration
 
-Because this SDK follows the OpenAI-style HTTP paths (`/v1/chat/completions`, `/v1/embeddings`, etc.), you can also point it directly at OpenAI or other compatible inference services.
+### Options
 
-#### Connect to OpenAI
+| Option | Env Variable | Default | Description |
+|--------|--------------|---------|-------------|
+| `base_url` | `SIMPLE_INFERENCE_BASE_URL` | `http://localhost:8000` | API base URL |
+| `api_key` | `SIMPLE_INFERENCE_API_KEY` | `nil` | API key (sent as `Authorization: Bearer <token>`) |
+| `api_prefix` | `SIMPLE_INFERENCE_API_PREFIX` | `/v1` | API path prefix (e.g., `/v1`, empty string for some providers) |
+| `timeout` | `SIMPLE_INFERENCE_TIMEOUT` | `nil` | Request timeout in seconds |
+| `open_timeout` | `SIMPLE_INFERENCE_OPEN_TIMEOUT` | `nil` | Connection open timeout |
+| `read_timeout` | `SIMPLE_INFERENCE_READ_TIMEOUT` | `nil` | Read timeout |
+| `raise_on_error` | `SIMPLE_INFERENCE_RAISE_ON_ERROR` | `true` | Raise exceptions on HTTP errors |
+| `headers` | – | `{}` | Additional headers to send with requests |
+| `adapter` | – | `Default` | HTTP adapter (see [Adapters](#http-adapters)) |
+
+### Provider Examples
+
+#### OpenAI
 
 ```ruby
 client = SimpleInference::Client.new(
   base_url: "https://api.openai.com",
-  api_key:  ENV["OPENAI_API_KEY"]
+  api_key: ENV["OPENAI_API_KEY"]
+)
+```
+
+#### 火山引擎 (Volcengine / ByteDance)
+
+火山引擎的 API 路径不包含 `/v1` 前缀，需要设置 `api_prefix: ""`：
+
+```ruby
+client = SimpleInference::Client.new(
+  base_url: "https://ark.cn-beijing.volces.com/api/v3",
+  api_key: ENV["ARK_API_KEY"],
+  api_prefix: ""  # 重要：火山引擎不使用 /v1 前缀
 )
 
 response = client.chat_completions(
-  model:    "gpt-4.1-mini",
-  messages: [{ "role" => "user", "content" => "Hello" }]
+  model: "deepseek-v3-250324",
+  messages: [
+    { "role" => "system", "content" => "你是人工智能助手" },
+    { "role" => "user", "content" => "你好" }
+  ]
 )
-
-pp response[:body]
 ```
 
-#### Streaming chat completions (SSE)
+#### DeepSeek
 
-For OpenAI-style streaming (`text/event-stream`), use `chat_completions_stream`. It yields parsed JSON events (Ruby `Hash`), so you can consume deltas incrementally:
+```ruby
+client = SimpleInference::Client.new(
+  base_url: "https://api.deepseek.com",
+  api_key: ENV["DEEPSEEK_API_KEY"]
+)
+```
+
+#### Groq
+
+```ruby
+client = SimpleInference::Client.new(
+  base_url: "https://api.groq.com/openai",
+  api_key: ENV["GROQ_API_KEY"]
+)
+```
+
+#### Together AI
+
+```ruby
+client = SimpleInference::Client.new(
+  base_url: "https://api.together.xyz",
+  api_key: ENV["TOGETHER_API_KEY"]
+)
+```
+
+#### Local inference servers (Ollama, vLLM, etc.)
+
+```ruby
+# Ollama
+client = SimpleInference::Client.new(
+  base_url: "http://localhost:11434"
+)
+
+# vLLM
+client = SimpleInference::Client.new(
+  base_url: "http://localhost:8000"
+)
+```
+
+#### Custom authentication header
+
+Some providers use non-standard authentication headers:
+
+```ruby
+client = SimpleInference::Client.new(
+  base_url: "https://my-service.example.com",
+  api_prefix: "/v1",
+  headers: {
+    "x-api-key" => ENV["MY_SERVICE_KEY"]
+  }
+)
+```
+
+## API Methods
+
+### Chat Completions
+
+```ruby
+response = client.chat_completions(
+  model: "gpt-4o-mini",
+  messages: [
+    { "role" => "system", "content" => "You are a helpful assistant." },
+    { "role" => "user", "content" => "Hello!" }
+  ],
+  temperature: 0.7,
+  max_tokens: 1000
+)
+
+puts response[:body]["choices"][0]["message"]["content"]
+```
+
+### Streaming Chat Completions
 
 ```ruby
 client.chat_completions_stream(
-  model: "gpt-4.1-mini",
-  messages: [{ "role" => "user", "content" => "Hello" }]
+  model: "gpt-4o-mini",
+  messages: [{ "role" => "user", "content" => "Tell me a story" }]
 ) do |event|
   delta = event.dig("choices", 0, "delta", "content")
   print delta if delta
@@ -190,65 +179,226 @@ end
 puts
 ```
 
-If you prefer, it also returns an Enumerator:
+Or use as an Enumerator:
 
 ```ruby
-client.chat_completions_stream(model: "gpt-4.1-mini", messages: [...]).each do |event|
-  # ...
+stream = client.chat_completions_stream(
+  model: "gpt-4o-mini",
+  messages: [{ "role" => "user", "content" => "Hello" }]
+)
+
+stream.each do |event|
+  # process event
 end
 ```
 
-Fallback behavior:
-
-- If the upstream service does **not** support streaming (for example, this repo's server currently returns `400` with `{"detail":"Streaming responses are not supported yet"}`), the SDK will **retry non-streaming** and yield a **single synthetic chunk** so your streaming consumer code can still run.
-
-#### Connect to any OpenAI-compatible endpoint
-
-For services that expose an OpenAI-compatible API (same paths and payloads), point `base_url` at that service and provide the correct token:
+### Embeddings
 
 ```ruby
-client = SimpleInference::Client.new(
-  base_url: "https://my-openai-compatible.example.com",
-  api_key:  ENV["MY_SERVICE_TOKEN"]
+response = client.embeddings(
+  model: "text-embedding-3-small",
+  input: "Hello, world!"
+)
+
+vector = response[:body]["data"][0]["embedding"]
+```
+
+### Rerank
+
+```ruby
+response = client.rerank(
+  model: "bge-reranker-v2-m3",
+  query: "What is machine learning?",
+  documents: [
+    "Machine learning is a subset of AI...",
+    "The weather today is sunny...",
+    "Deep learning uses neural networks..."
+  ]
 )
 ```
 
-If the service uses a non-standard header instead of `Authorization: Bearer`, you can omit `api_key` and pass headers explicitly:
+### Audio Transcription
 
 ```ruby
-client = SimpleInference::Client.new(
-  base_url: "https://my-service.example.com",
-  headers: {
-    "x-api-key" => ENV["MY_SERVICE_KEY"]
-  }
+response = client.audio_transcriptions(
+  model: "whisper-1",
+  file: File.open("audio.mp3", "rb")
+)
+
+puts response[:body]["text"]
+```
+
+### Audio Translation
+
+```ruby
+response = client.audio_translations(
+  model: "whisper-1",
+  file: File.open("audio.mp3", "rb")
 )
 ```
 
-### Puma vs Falcon (Fiber / Async) usage
-
-The default HTTP adapter uses Ruby's `Net::HTTP` and is safe to use under Puma's multithreaded model:
-
-- No global mutable state
-- Per-client configuration only
-- Blocking IO that integrates with Ruby 3 Fiber scheduler
-
-If you don't pass an adapter, `SimpleInference::Client` uses `SimpleInference::HTTPAdapters::Default` (Net::HTTP).
-
-For Falcon / async environments, you can keep the default adapter, or use the optional HTTPX adapter (requires the `httpx` gem):
+### List Models
 
 ```ruby
-gem "httpx" # optional, only required when using the HTTPX adapter
+response = client.list_models
+models = response[:body]["data"]
 ```
 
-You can then use the optional HTTPX adapter shipped with this gem:
+### Health Check
+
+```ruby
+# Returns full response
+response = client.health
+
+# Returns boolean
+if client.healthy?
+  puts "Service is up!"
+end
+```
+
+## Response Format
+
+All methods return a Hash with:
+
+```ruby
+{
+  status: 200,                    # HTTP status code
+  headers: { "content-type" => "application/json", ... },  # Response headers (lowercase keys)
+  body: { ... }                   # Parsed JSON body (Hash) or raw String
+}
+```
+
+## Error Handling
+
+By default, non-2xx responses raise exceptions:
+
+```ruby
+begin
+  client.chat_completions(model: "invalid", messages: [])
+rescue SimpleInference::Errors::HTTPError => e
+  puts "HTTP #{e.status}: #{e.message}"
+  puts e.body  # raw response body
+end
+```
+
+Other exception types:
+
+- `SimpleInference::Errors::TimeoutError` – Request timed out
+- `SimpleInference::Errors::ConnectionError` – Network error
+- `SimpleInference::Errors::DecodeError` – JSON parsing failed
+- `SimpleInference::Errors::ConfigurationError` – Invalid configuration
+
+To handle errors manually:
+
+```ruby
+client = SimpleInference::Client.new(
+  base_url: "https://api.openai.com",
+  api_key: ENV["OPENAI_API_KEY"],
+  raise_on_error: false
+)
+
+response = client.chat_completions(model: "gpt-4o-mini", messages: [...])
+
+if response[:status] == 200
+  # success
+else
+  puts "Error: #{response[:status]} - #{response[:body]}"
+end
+```
+
+## HTTP Adapters
+
+### Default (Net::HTTP)
+
+The default adapter uses Ruby's built-in `Net::HTTP`. It's thread-safe and compatible with Ruby 3 Fiber scheduler.
+
+### HTTPX Adapter
+
+For better performance or async environments, use the optional HTTPX adapter:
+
+```ruby
+# Gemfile
+gem "httpx"
+```
 
 ```ruby
 adapter = SimpleInference::HTTPAdapters::HTTPX.new(timeout: 30.0)
 
-SIMPLE_INFERENCE_CLIENT =
-  SimpleInference::Client.new(
-    base_url: ENV.fetch("SIMPLE_INFERENCE_BASE_URL", "http://localhost:8000"),
-    api_key:  ENV["SIMPLE_INFERENCE_API_KEY"],
-    adapter:  adapter
-  )
+client = SimpleInference::Client.new(
+  base_url: "https://api.openai.com",
+  api_key: ENV["OPENAI_API_KEY"],
+  adapter: adapter
+)
 ```
+
+### Custom Adapter
+
+Implement your own adapter by subclassing `SimpleInference::HTTPAdapter`:
+
+```ruby
+class MyAdapter < SimpleInference::HTTPAdapter
+  def call(request)
+    # request keys: :method, :url, :headers, :body, :timeout, :open_timeout, :read_timeout
+    # Must return: { status: Integer, headers: Hash, body: String }
+  end
+
+  def call_stream(request, &block)
+    # For streaming support (optional)
+    # Yield raw chunks to block for SSE responses
+  end
+end
+```
+
+## Rails Integration
+
+Create an initializer `config/initializers/simple_inference.rb`:
+
+```ruby
+INFERENCE_CLIENT = SimpleInference::Client.new(
+  base_url: ENV.fetch("INFERENCE_BASE_URL", "https://api.openai.com"),
+  api_key: ENV["INFERENCE_API_KEY"]
+)
+```
+
+Use in controllers:
+
+```ruby
+class ChatsController < ApplicationController
+  def create
+    response = INFERENCE_CLIENT.chat_completions(
+      model: "gpt-4o-mini",
+      messages: [{ "role" => "user", "content" => params[:prompt] }]
+    )
+
+    render json: response[:body]
+  end
+end
+```
+
+Use in background jobs:
+
+```ruby
+class EmbedJob < ApplicationJob
+  def perform(text)
+    response = INFERENCE_CLIENT.embeddings(
+      model: "text-embedding-3-small",
+      input: text
+    )
+
+    vector = response[:body]["data"][0]["embedding"]
+    # Store vector...
+  end
+end
+```
+
+## Thread Safety
+
+The client is thread-safe:
+
+- No global mutable state
+- Per-client configuration only
+- Each request uses its own HTTP connection
+
+## License
+
+MIT License. See [LICENSE](LICENSE.txt) for details.

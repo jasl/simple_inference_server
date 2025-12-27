@@ -23,7 +23,7 @@ module SimpleInference
     # POST /v1/chat/completions
     # params: { model: "model-name", messages: [...], ... }
     def chat_completions(params)
-      post_json("/v1/chat/completions", params)
+      post_json(api_path("/chat/completions"), params)
     end
 
     # POST /v1/chat/completions (streaming)
@@ -43,7 +43,7 @@ module SimpleInference
       body.delete("stream")
       body["stream"] = true
 
-      response = post_json_stream("/v1/chat/completions", body) do |event|
+      response = post_json_stream(api_path("/chat/completions"), body) do |event|
         yield event
       end
 
@@ -60,7 +60,7 @@ module SimpleInference
         fallback_body.delete(:stream)
         fallback_body.delete("stream")
 
-        fallback_response = post_json("/v1/chat/completions", fallback_body)
+        fallback_response = post_json(api_path("/chat/completions"), fallback_body)
         chunk = synthesize_chat_completion_chunk(fallback_response[:body])
         yield chunk if chunk
         return fallback_response
@@ -78,17 +78,17 @@ module SimpleInference
 
     # POST /v1/embeddings
     def embeddings(params)
-      post_json("/v1/embeddings", params)
+      post_json(api_path("/embeddings"), params)
     end
 
     # POST /v1/rerank
     def rerank(params)
-      post_json("/v1/rerank", params)
+      post_json(api_path("/rerank"), params)
     end
 
     # GET /v1/models
     def list_models
-      get_json("/v1/models")
+      get_json(api_path("/models"))
     end
 
     # GET /health
@@ -109,18 +109,22 @@ module SimpleInference
     # POST /v1/audio/transcriptions
     # params: { file: io_or_hash, model: "model-name", **audio_options }
     def audio_transcriptions(params)
-      post_multipart("/v1/audio/transcriptions", params)
+      post_multipart(api_path("/audio/transcriptions"), params)
     end
 
     # POST /v1/audio/translations
     def audio_translations(params)
-      post_multipart("/v1/audio/translations", params)
+      post_multipart(api_path("/audio/translations"), params)
     end
 
     private
 
     def base_url
       config.base_url
+    end
+
+    def api_path(endpoint)
+      "#{config.api_prefix}#{endpoint}"
     end
 
     def get_json(path, params: nil, raise_on_http_error: nil)
