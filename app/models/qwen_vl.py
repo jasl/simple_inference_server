@@ -255,7 +255,13 @@ class QwenVLChat(ChatModel):
             return None
         return "auto"
 
-    def count_tokens(self, messages: Sequence[dict[str, Any]], *, add_generation_prompt: bool = True) -> int:
+    def count_tokens(
+        self,
+        messages: Sequence[dict[str, Any]],
+        *,
+        add_generation_prompt: bool = True,
+        tools: list[dict[str, Any]] | None = None,
+    ) -> int:
         """Count tokens in a message sequence.
 
         By default, includes the generation prompt to match what will actually
@@ -264,12 +270,14 @@ class QwenVLChat(ChatModel):
         """
         with self._get_gen_lock():
             qwen_messages = self._to_qwen_messages(messages)
-            encoded = self.processor.apply_chat_template(
-                qwen_messages,
-                tokenize=True,
-                add_generation_prompt=add_generation_prompt,
-                return_tensors="pt",
-            )
+            kwargs: dict[str, Any] = {
+                "tokenize": True,
+                "add_generation_prompt": add_generation_prompt,
+                "return_tensors": "pt",
+            }
+            if tools:
+                kwargs["tools"] = tools
+            encoded = self.processor.apply_chat_template(qwen_messages, **kwargs)
             return int(encoded["input_ids"].shape[1])
 
     def batched_generate_prepared(
@@ -304,16 +312,19 @@ class QwenVLChat(ChatModel):
         messages: Sequence[dict[str, Any]],
         *,
         add_generation_prompt: bool = True,
+        tools: list[dict[str, Any]] | None = None,
     ) -> tuple[dict[str, Any], int]:
         with self._get_gen_lock():
             qwen_messages = self._to_qwen_messages(messages)
-            raw_inputs = self.processor.apply_chat_template(
-                qwen_messages,
-                tokenize=True,
-                add_generation_prompt=add_generation_prompt,
-                return_tensors="pt",
-                return_dict=True,
-            )
+            kwargs: dict[str, Any] = {
+                "tokenize": True,
+                "add_generation_prompt": add_generation_prompt,
+                "return_tensors": "pt",
+                "return_dict": True,
+            }
+            if tools:
+                kwargs["tools"] = tools
+            raw_inputs = self.processor.apply_chat_template(qwen_messages, **kwargs)
             inputs = self._normalize_chat_template_output(raw_inputs)
             prompt_len = int(inputs["input_ids"].shape[1])
             inputs["_prompt_len"] = prompt_len

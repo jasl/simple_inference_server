@@ -326,19 +326,27 @@ class TextChatModel(ChatModel):
         device = getattr(self.model, "device", None)
         return bool(torch.cuda.is_available() and device is not None and str(device).startswith("cuda"))
 
-    def count_tokens(self, messages: Sequence[dict[str, Any]], *, add_generation_prompt: bool = True) -> int:
+    def count_tokens(
+        self,
+        messages: Sequence[dict[str, Any]],
+        *,
+        add_generation_prompt: bool = True,
+        tools: list[dict[str, Any]] | None = None,
+    ) -> int:
         """Count tokens in a message sequence.
 
         By default, includes the generation prompt to match what will actually
         be sent to the model during generation. Set add_generation_prompt=False
         for raw message counting.
         """
-        encoded = self.tokenizer.apply_chat_template(
-            messages,
-            tokenize=True,
-            add_generation_prompt=add_generation_prompt,
-            return_tensors="pt",
-        )
+        kwargs: dict[str, Any] = {
+            "tokenize": True,
+            "add_generation_prompt": add_generation_prompt,
+            "return_tensors": "pt",
+        }
+        if tools:
+            kwargs["tools"] = tools
+        encoded = self.tokenizer.apply_chat_template(messages, **kwargs)
         return int(encoded["input_ids"].shape[1])
 
     def prepare_inputs(
@@ -346,14 +354,17 @@ class TextChatModel(ChatModel):
         messages: Sequence[dict[str, Any]],
         *,
         add_generation_prompt: bool = True,
+        tools: list[dict[str, Any]] | None = None,
     ) -> tuple[dict[str, Any], int]:
-        raw_inputs = self.tokenizer.apply_chat_template(
-            messages,
-            tokenize=True,
-            add_generation_prompt=add_generation_prompt,
-            return_tensors="pt",
-            return_dict=True,
-        )
+        kwargs: dict[str, Any] = {
+            "tokenize": True,
+            "add_generation_prompt": add_generation_prompt,
+            "return_tensors": "pt",
+            "return_dict": True,
+        }
+        if tools:
+            kwargs["tools"] = tools
+        raw_inputs = self.tokenizer.apply_chat_template(messages, **kwargs)
         normalized = self._normalize_chat_template_output(raw_inputs)
         prompt_len = int(normalized["input_ids"].shape[1])
         normalized["_prompt_len"] = prompt_len
