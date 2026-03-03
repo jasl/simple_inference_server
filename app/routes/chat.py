@@ -3,10 +3,11 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import re
 import threading
 import time
 from collections.abc import Sequence
-from typing import Annotated, Any, Literal
+from typing import Annotated, Any, Literal, Union
 from uuid import uuid4
 
 import httpx
@@ -79,14 +80,50 @@ class ChatContentPart(BaseModel):
         self._assert_valid(self)
 
 
+# ---------------------------------------------------------------------------
+# Tool calling schemas (OpenAI-compatible)
+# ---------------------------------------------------------------------------
+
+
+class ToolFunction(BaseModel):
+    """Function definition within a tool."""
+    name: str
+    description: str = ""
+    parameters: dict[str, Any] = Field(default_factory=dict)
+
+
+class Tool(BaseModel):
+    """Tool definition in the request."""
+    type: str = "function"
+    function: ToolFunction
+
+
+class ToolCallFunction(BaseModel):
+    """Function call in the response."""
+    name: str
+    arguments: str  # JSON-encoded string per OpenAI spec
+
+
+class ToolCall(BaseModel):
+    """Structured tool call in the response."""
+    id: str
+    type: str = "function"
+    function: ToolCallFunction
+
+
 class ChatMessage(BaseModel):
-    role: Literal["system", "user", "assistant"]
-    content: str | list[ChatContentPart]
+    role: Literal["system", "user", "assistant", "tool"]
+    content: str | list[ChatContentPart] | None = None
+    # For assistant messages that contain tool calls
+    tool_calls: list[ToolCall] | None = None
+    # For tool role messages — identifies which tool call this responds to
+    tool_call_id: str | None = None
 
 
 class ChatCompletionMessage(BaseModel):
     role: Literal["assistant"]
-    content: str
+    content: str | None = None
+    tool_calls: list[ToolCall] | None = None
 
 
 class ChatCompletionChoice(BaseModel):
@@ -140,6 +177,8 @@ class ChatCompletionRequest(BaseModel):
     stop: str | list[str] | None = None
     response_format: ChatResponseFormat | None = None
     user: str | None = None
+    tools: list[Tool] | None = None
+    tool_choice: Union[str, dict[str, Any]] | None = None
 
 
 class Usage(BaseModel):
@@ -349,9 +388,80 @@ def _build_generation_kwargs(  # noqa: PLR0913
     return kwargs
 
 
+# ---------------------------------------------------------------------------
+# Tool call parsing — extract structured calls from raw model output
+# ---------------------------------------------------------------------------
+
+
+def _parse_tool_calls(text: str) -> list[ToolCall] | None:
+    """Parse raw model output into OpenAI-format tool calls.
+
+    Supports multiple model families:
+    - Qwen3: <tool_call>{"name": "...", "arguments": {...}}</tool_call>
+    - Generic JSON: [{"name": "...", "arguments": {...}}] or {"name": "...", ...}
+    """
+    if not text:
+        return None
+
+    tool_calls: list[ToolCall] = []
+
+    # Pattern 1: Qwen3 <tool_call>...</tool_call> tags
+    qwen_pattern = r'<tool_call>\s*(\{.*?\})\s*</tool_call>'
+    qwen_matches = re.findall(qwen_pattern, text, re.DOTALL)
+    if qwen_matches:
+        for match in qwen_matches:
+            try:
+                parsed = json.loads(match)
+                name = parsed.get("name", "")
+                args = parsed.get("arguments", parsed.get("parameters", {}))
+                if isinstance(args, dict):
+                    args = json.dumps(args, ensure_ascii=False)
+                tool_calls.append(ToolCall(
+                    id=f"call_{uuid4().hex[:8]}",
+                    type="function",
+                    function=ToolCallFunction(name=name, arguments=args),
+                ))
+            except (json.JSONDecodeError, KeyError):
+                continue
+        if tool_calls:
+            return tool_calls
+
+    # Pattern 2: Mistral [TOOL_CALLS] [...]
+    mistral_match = re.search(r'\[TOOL_CALLS\]\s*(\[.*?\])', text, re.DOTALL)
+    if mistral_match:
+        try:
+            calls = json.loads(mistral_match.group(1))
+            if isinstance(calls, list):
+                for call in calls:
+                    name = call.get("name", "")
+                    args = call.get("arguments", call.get("parameters", {}))
+                    if isinstance(args, dict):
+                        args = json.dumps(args, ensure_ascii=False)
+                    tool_calls.append(ToolCall(
+                        id=f"call_{uuid4().hex[:8]}",
+                        type="function",
+                        function=ToolCallFunction(name=name, arguments=args),
+                    ))
+                if tool_calls:
+                    return tool_calls
+        except json.JSONDecodeError:
+            pass
+
+    return None
+
+
+def _extract_tools_for_template(tools: list[Tool] | None) -> list[dict[str, Any]] | None:
+    """Convert Tool models to dicts suitable for tokenizer.apply_chat_template(tools=...)."""
+    if not tools:
+        return None
+    return [t.model_dump(mode="python") for t in tools]
+
+
 async def _prepare_chat_request(
     model: Any,
     messages: list[dict[str, Any]],
+    *,
+    tools: list[dict[str, Any]] | None = None,
 ) -> tuple[dict[str, Any] | None, int]:
     loop = asyncio.get_running_loop()
     prepare_timeout = settings.chat_prepare_timeout_sec
@@ -362,7 +472,7 @@ async def _prepare_chat_request(
                 run_in_executor_with_context(
                     loop,
                     count_executor,
-                    lambda: model.prepare_inputs(messages, add_generation_prompt=True),
+                    lambda: model.prepare_inputs(messages, add_generation_prompt=True, tools=tools),
                 ),
                 timeout=prepare_timeout,
             )
@@ -387,6 +497,7 @@ async def _run_chat_generation(  # noqa: PLR0915
     request: Request,
     raw_messages: list[dict[str, Any]],
     has_images: bool,
+    tools: list[dict[str, Any]] | None = None,
 ) -> tuple[ChatGeneration, int, int]:
     model = _resolve_chat_model_and_caps(registry, req.model, has_images=has_images)
     max_tokens, temperature, top_p = _resolve_generation_params(req, model)
@@ -400,7 +511,7 @@ async def _run_chat_generation(  # noqa: PLR0915
     loop = asyncio.get_running_loop()
     executor = get_vision_executor() if has_images else get_chat_executor()
     max_prompt_tokens = settings.chat_max_prompt_tokens
-    prepared_inputs, prompt_tokens = await _prepare_chat_request(model, raw_messages)
+    prepared_inputs, prompt_tokens = await _prepare_chat_request(model, raw_messages, tools=tools)
     if prompt_tokens > max_prompt_tokens:
         record_chat_request(req.model, "400")
         raise HTTPException(
@@ -614,8 +725,9 @@ async def _create_chat_completions_local(  # noqa: PLR0912, PLR0915
     label_token = None
     has_images = False
     try:
-        raw_messages = [msg.model_dump(mode="python") for msg in req.messages]
+        raw_messages = [msg.model_dump(mode="python", exclude_none=True) for msg in req.messages]
         has_images = _contains_image_content(raw_messages)
+        tools_dicts = _extract_tools_for_template(req.tools)
         model = _resolve_chat_model_and_caps(registry, req.model, has_images=has_images)
 
         batcher = getattr(request.app.state, "chat_batching_service", None)
@@ -660,6 +772,7 @@ async def _create_chat_completions_local(  # noqa: PLR0912, PLR0915
                         request=request,
                         raw_messages=attempt_messages,
                         has_images=has_images,
+                        tools=tools_dicts,
                     )
             else:
                 generation, prompt_tokens, max_tokens = await _run_chat_generation(
@@ -668,6 +781,7 @@ async def _create_chat_completions_local(  # noqa: PLR0912, PLR0915
                     request=request,
                     raw_messages=attempt_messages,
                     has_images=has_images,
+                    tools=tools_dicts,
                 )
 
             if not structured_output:
@@ -756,11 +870,28 @@ async def _create_chat_completions_local(  # noqa: PLR0912, PLR0915
         completion_tokens=completion_tokens,
         total_tokens=prompt_tokens + completion_tokens,
     )
-    choice = ChatCompletionChoice(
-        index=0,
-        message=ChatCompletionMessage(role="assistant", content=generation.text),
-        finish_reason=generation.finish_reason or "stop",
-    )
+
+    # Check for tool calls in the generated text
+    parsed_tool_calls = None
+    if req.tools:
+        parsed_tool_calls = _parse_tool_calls(generation.text)
+
+    if parsed_tool_calls:
+        choice = ChatCompletionChoice(
+            index=0,
+            message=ChatCompletionMessage(
+                role="assistant",
+                content=None,
+                tool_calls=parsed_tool_calls,
+            ),
+            finish_reason="tool_calls",
+        )
+    else:
+        choice = ChatCompletionChoice(
+            index=0,
+            message=ChatCompletionMessage(role="assistant", content=generation.text),
+            finish_reason=generation.finish_reason or "stop",
+        )
     return ChatCompletionResponse(
         id=f"chatcmpl-{uuid4().hex}",
         created=int(time.time()),
